@@ -3,6 +3,7 @@ import os
 import numpy as np
 import pandas as pd
 from tqdm.auto import tqdm
+from multiprocessing import Pool, cpu_count
 
 # This script can now analyze logs from either wandb or tensorboard
 SUPPORTED_LOGGERS = ["wandb", "tensorboard"]
@@ -35,6 +36,7 @@ def read_tensorboard_log(log_dir: str) -> pd.DataFrame:
     try:
         from tensorboard.backend.event_processing import event_accumulator
     except ImportError:
+        # This will be caught by the worker and reported.
         raise ImportError("TensorBoard is required to analyze local logs. Please install with 'pip install tensorboard'.")
 
     ea = event_accumulator.EventAccumulator(log_dir,
@@ -49,15 +51,40 @@ def read_tensorboard_log(log_dir: str) -> pd.DataFrame:
     train_events = ea.Scalars('train_accuracy')
     val_events = ea.Scalars('validation_accuracy')
 
-    # Convert to DataFrames and merge
     df_train = pd.DataFrame([(e.step, e.value) for e in train_events], columns=['epoch', 'train_accuracy'])
     df_val = pd.DataFrame([(e.step, e.value) for e in val_events], columns=['epoch', 'validation_accuracy'])
     
     # Merge, forward-fill to align steps, and drop any initial NaNs
     history_df = pd.merge(df_train, df_val, on='epoch', how='outer').sort_values('epoch')
+    # --- FIX: Use modern .ffill() method ---
     history_df = history_df.ffill().dropna()
     
     return history_df
+
+def analyze_tensorboard_worker(run_dir_path: str):
+    """
+    Worker function to analyze a single TensorBoard run.
+    """
+    run_name = os.path.basename(run_dir_path)
+    try:
+        history = read_tensorboard_log(run_dir_path)
+        if history is None or history.empty or len(history) < 100:
+            return None
+
+        grokking_epoch = find_grokking_point(
+            history["epoch"].values,
+            history["train_accuracy"].values,
+            history["validation_accuracy"].values
+        )
+        return {
+            'run_name': run_name,
+            'grokking_detected': grokking_epoch != -1,
+            'grokking_epoch': grokking_epoch
+        }
+    except Exception as e:
+        # Suppress noisy errors from failed reads in parallel mode
+        return None
+
 
 def main():
     parser = argparse.ArgumentParser(description="Analyze training runs for grokking events.")
@@ -84,14 +111,12 @@ def main():
                 grokking_epoch = find_grokking_point(history["epoch"].values, history["train_accuracy"].values, history["validation_accuracy"].values)
                 
                 if grokking_epoch != -1:
-                    # Update wandb run with tag and metadata
                     new_tag = "groks"
                     if new_tag not in run.tags:
                         run.tags.append(new_tag)
                         run.summary["grokking_event"] = f"Grokking event detected around epoch: {grokking_epoch}"
                         run.update()
                         tqdm.write(f"  - Tagged run '{run.name}' as grokking at epoch {grokking_epoch}")
-
         except Exception as e:
             print(f"An error occurred with wandb: {e}")
 
@@ -100,22 +125,19 @@ def main():
             print(f"Error: Log directory not found at '{args.path}'")
             return
         
-        run_dirs = sorted([d for d in os.listdir(args.path) if os.path.isdir(os.path.join(args.path, d))])
-        print(f"Found {len(run_dirs)} potential runs in '{args.path}'. Analyzing...")
+        run_dirs = [os.path.join(args.path, d) for d in sorted(os.listdir(args.path)) if os.path.isdir(os.path.join(args.path, d))]
+        print(f"Found {len(run_dirs)} potential runs in '{args.path}'. Analyzing in parallel...")
 
-        for run_name in tqdm(run_dirs, desc="Analyzing TensorBoard logs"):
-            log_dir = os.path.join(args.path, run_name)
-            history = read_tensorboard_log(log_dir)
-
-            if history is None or history.empty or len(history) < 100:
-                continue
-
-            grokking_epoch = find_grokking_point(history["epoch"].values, history["train_accuracy"].values, history["validation_accuracy"].values)
-            analysis_results.append({
-                'run_name': run_name,
-                'grokking_detected': grokking_epoch != -1,
-                'grokking_epoch': grokking_epoch
-            })
+        # --- Parallel Analysis Loop ---
+        with Pool(cpu_count()) as p:
+            results = list(tqdm(
+                p.imap(analyze_tensorboard_worker, run_dirs),
+                total=len(run_dirs),
+                desc="Analyzing Logs"
+            ))
+        
+        # Filter out None results from failed runs
+        analysis_results = [r for r in results if r is not None]
         
         if analysis_results:
             summary_df = pd.DataFrame(analysis_results)
@@ -124,6 +146,8 @@ def main():
             print("\n--- Analysis Summary ---")
             print(summary_df[summary_df['grokking_detected'] == True].to_markdown(index=False))
             print(f"\nFull summary saved to: {summary_file}")
+        else:
+            print("\nNo valid runs with sufficient data were found to analyze.")
 
 if __name__ == '__main__':
     main()
