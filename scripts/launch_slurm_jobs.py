@@ -10,44 +10,40 @@ def generate_slurm_script(job_name: str, account: str, time: str, nodes: int, da
     """
     Generates the content of the SLURM submission script for a large MPI job.
     """
-    num_gpus = nodes * 8
+    num_cores = nodes * 32
     # Convert to absolute path to be safe on compute nodes
     abs_datasets_dir = os.path.abspath(datasets_dir)
     slurm_script_content = f"""#!/bin/bash
 #SBATCH --job-name={job_name}
 #SBATCH --account={account}
-#SBATCH -p extended
-#SBATCH -q debug
+#SBATCH -p batch
 #SBATCH --nodes={nodes}
-#SBATCH --ntasks-per-node=8
-#SBATCH --gpus-per-task=1
-#SBATCH --cpus-per-task=8
-#SBATCH -S 0
-#SBATCH -C nvme
+#SBATCH --ntasks-per-node=32
+#SBATCH --cpus-per-task=1
 #SBATCH --time={time}
 #SBATCH -o slurm/%j.out
 #SBATCH -e slurm/%j.err
 
 # --- Environment Setup ---
 
-# this is valid for my Frontier environment, but you'll likely have to modify it
-source /lustre/orion/stf006/world-shared/$USER/sbcast_env.sh
-module load rocm/6.4.1
+# this is valid for my andes environment, but you'll likely have to modify it
+source /lustre/orion/world-shared/stf006/glaser/miniconda3/etc/profile.d/conda.sh
+conda activate jax
 
+export TRANSFORMERS_OFFLINE=1
 export HF_HOME=/lustre/orion/stf006/scratch/$USER
-export WANDB_MODE=offline
-export WANDB_CACHE_DIR=/mnt/bb/$USER/wandb_cache
+export WANDB_CACHE_DIR=/tmp/wandb_cache
 export HTTP_PROXY=http://proxy.ccs.ornl.gov:3128
 export HTTPS_PROXY=http://proxy.ccs.ornl.gov:3128
 
 echo "Job starting on $(hostname)"
 echo "SLURM Job ID: $SLURM_JOB_ID"
-echo "Allocated {nodes} nodes for a total of {num_gpus} GPUs."
+echo "Allocated {nodes} nodes for a total of {num_cores} cores."
 
 # --- Launch MPI Runner ---
 # srun will start the mpi_runner.py script on every allocated core.
 # We now pass all hyperparameters and the unique task list file to the MPI runner.
-srun --cpu-bind=none python mpi_runner.py \\
+srun python mpi_runner.py \\
     --datasets_dir {abs_datasets_dir} \\
     --task_list {task_file} \\
     --epochs {epochs} \\
