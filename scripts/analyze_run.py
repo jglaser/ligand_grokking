@@ -55,7 +55,7 @@ def read_tensorboard_log(log_dir: str) -> pd.DataFrame:
     
     # Merge, forward-fill to align steps, and drop any initial NaNs
     history_df = pd.merge(df_train, df_val, on='epoch', how='outer').sort_values('epoch')
-    history_df = history_df.fillna(method='ffill').dropna()
+    history_df = history_df.ffill().dropna()
     
     return history_df
 
