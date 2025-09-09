@@ -7,13 +7,6 @@ import optax
 from tqdm.auto import trange
 import numpy as np
 
-# Optional wandb import
-try:
-    import wandb
-    WANDB_AVAILABLE = True
-except ImportError:
-    WANDB_AVAILABLE = False
-
 # Optional sklearn for metrics
 try:
     from sklearn.metrics import roc_auc_score
@@ -186,7 +179,7 @@ class SparseVariationalGPClassifier:
         else: raise ValueError(f"Unknown sampler: {self.sampler}")
 
 
-    def fit(self, X_train, y_train, epochs=100, batch_size=128, random_seed=0, wandb_run=None, bias_potential=None, mesh=None):
+    def fit(self, X_train, y_train, epochs=100, batch_size=128, random_seed=0, bias_potential=None, mesh=None):
         """
         MODIFIED: `log_alpha` initialization removed as it's not needed for classification.
         """
@@ -247,12 +240,11 @@ class SparseVariationalGPClassifier:
 
             pbar.set_description(f"Epoch {epoch+1}/{epochs} | Loss: {avg_metrics['loss']:.4f}")
 
-            if wandb_run and WANDB_AVAILABLE:
-                log_data = {"epoch": epoch, **avg_metrics}
-                if self.log_callback:
-                    custom_metrics = self.log_callback(self, epoch, avg_metrics, self.params, self.bias_state)
-                    if custom_metrics: log_data.update(custom_metrics)
-                wandb_run.log(log_data)
+            log_data = {"epoch": epoch, **avg_metrics}
+            if self.log_callback:
+                custom_metrics = self.log_callback(self, epoch, avg_metrics, self.params, self.bias_state)
+                if custom_metrics: log_data.update(custom_metrics)
+
         return self
 
     @staticmethod
