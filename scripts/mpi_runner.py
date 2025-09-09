@@ -16,8 +16,6 @@ def run_training_task(task_tuple):
 
     # --- Determine Local GPU ---
     local_rank = int(os.environ.get('SLURM_LOCALID', rank % 8))
-    worker_env = os.environ.copy()
-    worker_env['CUDA_VISIBLE_DEVICES'] = str(local_rank)
 
     # --- Unpack Task and Run ---
     try:
@@ -35,18 +33,19 @@ def run_training_task(task_tuple):
             return f"Skipped: {pdb_id}"
 
         command = [
-            "python", "train_classifier.py",
+            "python", "../svgp/train_classifier.py",
             train_file,
             test_file,
             "--random_seed", seed,
             "--wandb_run_name", run_name,
+            "--wandb_project", "grok_pdbbind",
             "--learning_rate", "1e-5",
             "--n_inducing_points", "100",
-            "--encoder_dim", "8",
+            "--encoder_dim", "16",
             "--epochs", "200000"
         ]
 
-        subprocess.run(command, env=worker_env, check=True)
+        subprocess.run(command, check=True)
 
         print(f"Rank {rank} successfully completed task: PDB={pdb_id}, Seed={seed}", flush=True)
         return f"Success: {pdb_id}"

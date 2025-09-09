@@ -12,11 +12,13 @@ def generate_slurm_script(job_name: str, account: str, time: str, nodes: int, da
     slurm_script_content = f"""#!/bin/bash
 #SBATCH --job-name={job_name}
 #SBATCH --account={account}
-#SBATCH -p extended
+#SBATCH -p batch
 #SBATCH -q debug
 #SBATCH --nodes={nodes}
 #SBATCH --ntasks-per-node=8
 #SBATCH --gpus-per-task=1
+#SBATCH --cpus-per-task=8
+#SBATCH -S 0
 #SBATCH --time={time}
 #SBATCH -o slurm/%j.out
 #SBATCH -e slurm/%j.err
@@ -28,6 +30,11 @@ def generate_slurm_script(job_name: str, account: str, time: str, nodes: int, da
 conda activate grpo
 module load rocm/6.4.1
 
+export HF_HOME=/lustre/orion/stf006/scratch/$USER
+export WANDB_CACHE_DIR=/mnt/bb/$USER/wandb_cache
+export HTTP_PROXY=http://proxy.ccs.ornl.gov:3128
+export HTTPS_PROXY=http://proxy.ccs.ornl.gov:3128
+
 echo "Job starting on $(hostname)"
 echo "SLURM Job ID: $SLURM_JOB_ID"
 echo "Allocated {nodes} nodes for a total of {num_gpus} GPUs."
@@ -35,7 +42,7 @@ echo "Allocated {nodes} nodes for a total of {num_gpus} GPUs."
 # --- Launch MPI Runner ---
 # srun will start the mpi_runner.py script on every allocated core.
 # We now pass the absolute path to the datasets directory.
-srun --cpu-bind=none python mpi_runner.py --datasets_dir {abs_datasets_dir}
+srun python mpi_runner.py --datasets_dir {abs_datasets_dir}
 
 echo "Job finished with exit code $?"
 """
