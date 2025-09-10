@@ -33,7 +33,7 @@ def run_training_task(task_tuple):
             return f"Skipped: {pdb_id}"
 
         command = [
-            "python", "train_classifier.py", train_file, test_file,
+            "python", "../svgp/train_classifier.py", train_file, test_file,
             "--random_seed", str(seed),
             "--wandb_run_name", run_name,
             "--wandb_project", wandb_project,
