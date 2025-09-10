@@ -24,7 +24,7 @@ def main():
         print(f"Error: Grokking summary file not found at '{args.grokking_summary}'")
         return
 
-    grokking_df['pdb_id'] = grokking_df['run_name'].apply(lambda x: x.split('-seed-')[0])
+    grokking_df['pdb_id'] = grokking_df['run_name'].apply(lambda x: x.split('-seed')[0])
 
     grokking_summary = grokking_df.groupby('pdb_id').agg(
         grokking_frequency=('grokking_detected', 'mean'),

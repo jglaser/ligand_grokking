@@ -128,12 +128,13 @@ def log_callback_factory(X_train, y_train, X_val, y_val, logger):
             X_train_subset, y_train_subset = X_train[train_subset_idx], y_train[train_subset_idx]
             train_score = model.score(X_train_subset, y_train_subset, params=params)
             metrics["train_accuracy"] = train_score
-        if epoch % 10 == 0 and 'encoder_params' in params and 'W' in params['encoder_params']:
+        if epoch % 100 == 0 and 'encoder_params' in params and 'W' in params['encoder_params']:
             svals = jnp.linalg.svd(params['encoder_params']['W'], compute_uv=False)
             metrics['htsr_alpha'] = estimate_alpha_fit(svals**2)
         
         # Use the logger object to log the metrics
-        logger.log(metrics, step=epoch)
+        if epoch % 100 == 0:
+            logger.log(metrics, step=epoch)
         return metrics # Return for progress bar
     return log_callback
 

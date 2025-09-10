@@ -64,11 +64,11 @@ def main():
                 x=args.x_axis,
                 y=args.y_axis,
                 hue=args.color_by,
-                palette="viridis_r", # Reversed palette (low delay = bright yellow)
+                palette="viridis_r", # High delay -> Dark color
                 size=args.color_by,
                 # --- THE FIX ---
-                # Reverse the size mapping so low delay = large size
-                sizes=(200, 30), 
+                # Ensure high delay corresponds to large size
+                sizes=(30, 200),
                 alpha=0.8,
                 edgecolor="black",
                 linewidth=0.5,
@@ -83,7 +83,9 @@ def main():
             data=non_grokking_df,
             x=args.x_axis,
             y=args.y_axis,
-            color='lightgray',
+            color='none',
+            edgecolor='k',
+            linewidth=1,
             s=20, # Small size for background points
             alpha=0.5,
             ax=ax,
@@ -98,8 +100,8 @@ def main():
                 x=args.x_axis,
                 y=args.y_axis,
                 hue=args.color_by,
-                palette="viridis",
-                size=args.color_by,
+                palette="viridis", # High frequency -> Bright color
+                size=args.color_by, # High frequency -> Big size
                 sizes=(30, 200),
                 alpha=0.8,
                 edgecolor="black",
