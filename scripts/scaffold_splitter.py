@@ -10,27 +10,33 @@ from rdkit import Chem
 from rdkit.Chem.Scaffolds import MurckoScaffold
 from tqdm.auto import tqdm
 
-# --- Worker functions for parallel processing (must be at top level) ---
-def canonicalize_smiles_worker(smiles: str) -> str:
+def canonicalize_smiles(smiles: str) -> str:
     """Canonicalizes a single SMILES string."""
-    try:
-        mol = Chem.MolFromSmiles(smiles)
-        if mol:
-            return Chem.MolToSmiles(mol, canonical=True)
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
         return None
-    except:
-        return None
+    return Chem.MolToSmiles(mol, canonical=True)
 
-def get_scaffold(smiles_string: str) -> str:
-    """Computes the Murcko scaffold for a given SMILES string."""
+def canonicalize_batch(batch_df: pl.DataFrame) -> pl.DataFrame:
+    smiles_list = batch_df["smiles"].to_list()
+    canonical_list = [canonicalize_smiles(s) for s in smiles_list]
+    return batch_df.with_columns(pl.Series("smiles", canonical_list))
+
+def get_scaffold(smiles_string: str) -> str | None:
+    """
+    Computes the Murcko scaffold for a given SMILES string.
+    Returns the canonical SMILES of the scaffold, or None if invalid.
+    """
     try:
         mol = Chem.MolFromSmiles(smiles_string)
-        if mol:
-            scaffold = MurckoScaffold.GetScaffoldForMol(mol)
-            return Chem.MolToSmiles(scaffold, canonical=True)
-        return ""
-    except:
-        return ""
+        if mol is None:
+            return None
+        scaffold = MurckoScaffold.GetScaffoldForMol(mol)
+        if scaffold is None:
+            return None
+        return Chem.MolToSmiles(scaffold, canonical=True)
+    except Exception:
+        return None
 
 def process_and_save_target(args_tuple):
     """
@@ -69,16 +75,6 @@ def process_and_save_target(args_tuple):
         'num_train': len(train_df),
         'num_test': len(test_df)
     }
-
-def parallel_canonicalize(smiles_series: pd.Series) -> list:
-    """Canonicalizes a pandas Series of SMILES strings in parallel."""
-    with Pool(cpu_count()) as p:
-        canonical_smiles_list = list(tqdm(
-            p.imap(canonicalize_smiles_worker, smiles_series, chunksize=1000),
-            total=len(smiles_series),
-            desc="Canonicalizing SMILES"
-        ))
-    return canonical_smiles_list
 
 def create_scaffold_split(df: pd.DataFrame, test_size: float = 0.2):
     """Splits a DataFrame into training and test sets based on molecular scaffolds."""
