@@ -3,8 +3,9 @@ import pandas as pd
 
 def main():
     """
-    Performs a meta-analysis by combining grokking results with pocket metadata
-    to find features predictive of the grokking phenomenon.
+    Performs a two-stage meta-analysis by first correlating grokking frequency
+    across all targets, and then correlating grokking delay only for the
+    subset of targets that were observed to grok.
     """
     parser = argparse.ArgumentParser(
         description="Analyze grokking frequency and delay, and find predictive pocket features.",
@@ -27,6 +28,7 @@ def main():
 
     grokking_summary = grokking_df.groupby('pdb_id').agg(
         grokking_frequency=('grokking_detected', 'mean'),
+        # The mean of an empty series will be NaN for non-grokking targets
         average_grokking_delay=('grokking_delay', lambda x: x[x != -1].mean())
     ).reset_index()
     
@@ -44,32 +46,56 @@ def main():
         print("Error: Merge resulted in an empty DataFrame. Check that PDB IDs match.")
         return
 
-    # --- 3. Correlation Analysis ---
-    numeric_cols = ['grokking_frequency', 'average_grokking_delay', 'num_residues', 'volume_A3', 
-                    'hydrophobic_sasa_nm2', 'hbond_donors', 'hbond_acceptors', 'net_charge', 'polarity_score']
+    # --- 3. First Analysis: Grokking Frequency (All Targets) ---
+    print("\n--- Meta-Analysis Part 1: Grokking Frequency (All Targets) ---")
     
-    for col in numeric_cols:
-        if col in meta_df.columns:
-            meta_df[col] = pd.to_numeric(meta_df[col], errors='coerce')
-    meta_df.dropna(subset=numeric_cols, inplace=True)
+    # Define the columns we want to correlate against
+    feature_cols = ['num_residues', 'volume_A3', 'hydrophobic_sasa_nm2', 
+                    'hbond_donors', 'hbond_acceptors', 'net_charge', 'polarity_score']
 
-    if len(meta_df) < 2:
-        print("Not enough overlapping data for correlation analysis.")
-        return
+    # Ensure all feature columns are numeric for correlation
+    df_for_freq_analysis = meta_df.copy()
+    for col in feature_cols:
+        if col in df_for_freq_analysis.columns:
+            df_for_freq_analysis[col] = pd.to_numeric(df_for_freq_analysis[col], errors='coerce')
+    df_for_freq_analysis.dropna(subset=feature_cols, inplace=True)
+    
+    print(f"Analyzing {len(df_for_freq_analysis)} targets with complete metadata.")
+    
+    if len(df_for_freq_analysis) > 1:
+        freq_correlations = df_for_freq_analysis[['grokking_frequency'] + feature_cols].corr()['grokking_frequency'].drop('grokking_frequency')
+        print("\nCorrelation with Grokking Frequency:")
+        print(freq_correlations.to_string())
+    else:
+        print("Not enough data for frequency correlation analysis.")
 
-    correlations = meta_df[numeric_cols].corr()
 
-    # --- 4. Save and Display Results ---
+    # --- 4. Second Analysis: Grokking Delay (Grokking Subset Only) ---
+    print("\n--- Meta-Analysis Part 2: Grokking Delay (Grokking Subset) ---")
+    
+    # Create a subset of targets that grokked at least once
+    grokking_subset_df = meta_df[meta_df['grokking_frequency'] > 0].copy()
+    
+    # Clean and prepare this smaller subset for correlation
+    for col in feature_cols:
+         if col in grokking_subset_df.columns:
+            grokking_subset_df[col] = pd.to_numeric(grokking_subset_df[col], errors='coerce')
+    grokking_subset_df.dropna(subset=['average_grokking_delay'] + feature_cols, inplace=True)
+
+    print(f"Analyzing {len(grokking_subset_df)} targets that grokked at least once.")
+    
+    if len(grokking_subset_df) > 1:
+        delay_correlations = grokking_subset_df[['average_grokking_delay'] + feature_cols].corr()['average_grokking_delay'].drop('average_grokking_delay')
+        print("\nCorrelation with Average Grokking Delay:")
+        print(delay_correlations.to_string())
+    else:
+        print("Not enough data for delay correlation analysis (fewer than 2 targets grokked).")
+
+
+    # --- 5. Save Full Data Table ---
     meta_df.to_csv(args.output_file, index=False)
-    
-    print("\n--- Meta-Analysis Summary ---")
-    print("\nCorrelation with Grokking Frequency:")
-    print(correlations['grokking_frequency'].drop('grokking_frequency').to_string())
-    
-    print("\nCorrelation with Average Grokking Delay:")
-    print(correlations['average_grokking_delay'].drop('average_grokking_delay').to_string())
-
     print(f"\nFull merged analysis table saved to: {args.output_file}")
+
 
 if __name__ == "__main__":
     main()
