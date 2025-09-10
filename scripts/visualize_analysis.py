@@ -6,7 +6,8 @@ import matplotlib.pyplot as plt
 def main():
     """
     Creates a publication-quality scatter plot to visualize the relationship
-    between pocket properties and grokking behavior.
+    between pocket properties and grokking behavior, separating grokking and
+    non-grokking targets for clarity.
     """
     parser = argparse.ArgumentParser(
         description="Generate a scatter plot from the grokking meta-analysis results.",
@@ -32,57 +33,94 @@ def main():
         return
 
     # --- 2. Validate Columns ---
-    required_cols = {args.x_axis, args.y_axis, args.color_by, 'pdb_id'}
+    required_cols = {args.x_axis, args.y_axis, args.color_by, 'pdb_id', 'grokking_frequency'}
     if not required_cols.issubset(df.columns):
         missing = required_cols - set(df.columns)
         print(f"Error: One or more specified columns are missing from the input file: {list(missing)}")
         return
         
-    # --- 3. Handle Missing Data Gracefully ---
-    # First, drop any rows that are missing the core coordinates for the plot.
+    # --- 3. Handle Missing Data and Partition ---
     df.dropna(subset=[args.x_axis, args.y_axis], inplace=True)
     
-    # Then, specifically handle NaNs in the coloring column. This is crucial for
-    # including targets that never grokked (where average_grokking_delay is NaN).
-    if args.color_by in df.columns:
-        df[args.color_by].fillna(0, inplace=True)
-    
-    print(f"Plotting {len(df)} data points after cleaning.")
+    # Partition the data into grokking and non-grokking sets
+    grokking_df = df[df['grokking_frequency'] > 0].copy()
+    non_grokking_df = df[df['grokking_frequency'] == 0].copy()
 
     # --- 4. Create the Plot using Seaborn/Matplotlib ---
     print(f"Generating plot: '{args.x_axis}' vs '{args.y_axis}', colored by '{args.color_by}'...")
     
     plt.style.use('seaborn-v0_8-whitegrid')
-    plt.figure(figsize=(10, 8))
+    fig, ax = plt.subplots(figsize=(10, 8))
 
-    scatter_plot = sns.scatterplot(
-        data=df,
-        x=args.x_axis,
-        y=args.y_axis,
-        hue=args.color_by,
-        palette="viridis",
-        size=args.color_by, # Optionally size points by the same metric
-        sizes=(20, 200),
-        alpha=0.7,
-        edgecolor="black",
-        linewidth=0.5
-    )
+    # --- Conditional Plotting Logic ---
+    if args.color_by == 'average_grokking_delay':
+        # Only plot the targets that actually grokked when coloring by delay
+        print(f"Plotting {len(grokking_df)} targets that grokked (coloring by delay).")
+        grokking_df.dropna(subset=[args.color_by], inplace=True)
+        
+        if not grokking_df.empty:
+            sns.scatterplot(
+                data=grokking_df,
+                x=args.x_axis,
+                y=args.y_axis,
+                hue=args.color_by,
+                palette="viridis_r", # Reversed palette (low delay = bright yellow)
+                size=args.color_by,
+                # --- THE FIX ---
+                # Reverse the size mapping so low delay = large size
+                sizes=(200, 30), 
+                alpha=0.8,
+                edgecolor="black",
+                linewidth=0.5,
+                ax=ax
+            )
+    else:
+        # Plotting frequency or other metrics: show non-grokking as a background
+        print(f"Plotting {len(grokking_df)} grokking targets and {len(non_grokking_df)} non-grokking targets (as background).")
+        
+        # Plot the background points first
+        sns.scatterplot(
+            data=non_grokking_df,
+            x=args.x_axis,
+            y=args.y_axis,
+            color='lightgray',
+            s=20, # Small size for background points
+            alpha=0.5,
+            ax=ax,
+            legend=False # No legend for background points
+        )
+        
+        # Plot the grokking points on top
+        if not grokking_df.empty:
+            grokking_df[args.color_by].fillna(0, inplace=True)
+            sns.scatterplot(
+                data=grokking_df,
+                x=args.x_axis,
+                y=args.y_axis,
+                hue=args.color_by,
+                palette="viridis",
+                size=args.color_by,
+                sizes=(30, 200),
+                alpha=0.8,
+                edgecolor="black",
+                linewidth=0.5,
+                ax=ax
+            )
     
     # --- 5. Customize and Save ---
-    plt.title("Grokking Behavior vs. Pocket Physicochemical Properties", fontsize=16)
+    ax.set_title("Grokking Behavior vs. Pocket Physicochemical Properties", fontsize=16)
     
-    # Create more descriptive labels
     x_label = args.x_axis.replace('_', ' ').title()
     if "sasa" in args.x_axis: x_label += " (nm²)"
         
     y_label = args.y_axis.replace('_', ' ').title()
     
-    plt.xlabel(x_label, fontsize=12)
-    plt.ylabel(y_label, fontsize=12)
+    ax.set_xlabel(x_label, fontsize=12)
+    ax.set_ylabel(y_label, fontsize=12)
     
-    # Update legend title
-    legend = scatter_plot.get_legend()
-    legend.set_title(args.color_by.replace('_', ' ').title())
+    legend = ax.get_legend()
+    if legend:
+        legend.set_title(args.color_by.replace('_', ' ').title())
 
     try:
         plt.savefig(args.output_file, format='pdf', bbox_inches='tight')
