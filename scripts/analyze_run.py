@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 from tqdm.auto import tqdm
 from multiprocessing import Pool, cpu_count
+from scipy.stats import pearsonr # Import the pearsonr function
 
 def find_grokking_point_vectorized(epochs, train_acc, val_acc,
                                    overfit_threshold=0.9, plateau_threshold=0.75,
@@ -86,51 +87,6 @@ def find_grokking_point_vectorized(epochs, train_acc, val_acc,
         # Memorized but no grokking event was found
         return memorization_epoch, -1
 
-def find_grokking_point(epochs, train_acc, val_acc,
-                        overfit_threshold=0.9, plateau_threshold=0.75,
-                        jump_threshold=0.05, window_size=50,
-                        min_delay_epochs=500, sustain_window_multiplier=3):
-    """
-    Analyzes a training trajectory for a true "delayed generalization" event.
-    Requires a sustained period of overfitting before a sustained jump to a
-    new, high-accuracy state.
-    """
-    if len(val_acc) < window_size * (sustain_window_multiplier + 1):
-        return -1, -1
-
-    val_acc_smooth = pd.Series(val_acc).rolling(window=window_size, min_periods=1, center=True).mean().values
-    
-    # 1. Find the point of sustained memorization
-    sustained_high_train = (pd.Series(train_acc).rolling(window=window_size).mean() > overfit_threshold)
-    true_indices = np.where(sustained_high_train)[0]
-    if len(true_indices) == 0:
-        return -1, -1 # Never memorized
-        
-    first_high_train_idx = true_indices[0]
-    memorization_epoch = epochs[first_high_train_idx]
-
-    # 2. Search for a grokking jump AFTER the memorization point
-    # We stop searching early enough to have a window to check for sustained accuracy
-    search_end_idx = len(epochs) - (window_size * sustain_window_multiplier)
-    for i in range(first_high_train_idx + 1, search_end_idx):
-        is_in_plateau = val_acc_smooth[i] < plateau_threshold
-        has_sufficient_delay = (epochs[i] - memorization_epoch) > min_delay_epochs
-
-        if is_in_plateau and has_sufficient_delay:
-            jump_size = val_acc_smooth[i + window_size] - val_acc_smooth[i]
-            
-            if jump_size > jump_threshold:
-                # --- NEW: Check for SUSTAINED high accuracy after the jump ---
-                post_jump_window_start = i + window_size
-                post_jump_window_end = i + window_size * sustain_window_multiplier
-                avg_post_jump_acc = np.mean(val_acc_smooth[post_jump_window_start:post_jump_window_end])
-                
-                # The new state must be sustainably above the old plateau
-                if avg_post_jump_acc > plateau_threshold:
-                    grokking_epoch = epochs[i]
-                    return memorization_epoch, grokking_epoch
-                
-    return memorization_epoch, -1 # Memorized but never grokked
 
 def read_tensorboard_log(log_dir: str) -> pd.DataFrame:
     # ... (function is the same as before)
@@ -154,7 +110,7 @@ def analyze_log_worker(run_dir_path: str):
         history = read_tensorboard_log(run_dir_path)
         if history is None: return {'run_name': run_name, 'status': 'failed_read'}
         if history.empty or len(history) < 100: return {'run_name': run_name, 'status': 'too_short'}
-        mem_epoch, grok_epoch = find_grokking_point(history["epoch"].values, history["train_accuracy"].values, history["validation_accuracy"].values)
+        mem_epoch, grok_epoch = find_grokking_point_vectorized(history["epoch"].values, history["train_accuracy"].values, history["validation_accuracy"].values)
         delay = grok_epoch - mem_epoch if grok_epoch != -1 and mem_epoch != -1 else -1
         return {'run_name': run_name, 'memorization_epoch': mem_epoch, 'grokking_epoch': grok_epoch,
                 'grokking_delay': delay, 'grokking_detected': grok_epoch != -1, 'status': 'success'}
@@ -165,6 +121,7 @@ def main():
     parser = argparse.ArgumentParser(description="Analyze a directory of TensorBoard logs for grokking events.")
     # ... (parser args are the same as before)
     parser.add_argument("log_dir", type=str, help="Path to the local TensorBoard log directory ('logs/').")
+    parser.add_argument("dataset_summary_file", type=str, help="Path to the dataset_split_summary.csv file.")
     parser.add_argument("--output_file", type=str, default="grokking_analysis_summary.csv", help="Name for the output summary CSV file.")
     args = parser.parse_args()
     
@@ -185,8 +142,38 @@ def main():
             if result.get('grokking_detected', False): stats['grokking_runs'] += 1
     if successful_results:
         summary_df = pd.DataFrame(successful_results)
+
+        # --- Merge with dataset summary to include scaffold counts ---
+        try:
+            dataset_summary_df = pd.read_csv(args.dataset_summary_file)
+            # Extract pdb_id from run_name for merging
+            summary_df['pdb_id'] = summary_df['run_name'].apply(lambda x: x.split('-seed')[0])
+            # Merge the two dataframes
+            summary_df = pd.merge(summary_df, dataset_summary_df[['pdb_id', 'num_scaffolds']], on='pdb_id', how='left')
+        except FileNotFoundError:
+            print(f"Warning: Dataset summary file not found at '{args.dataset_summary_file}'. Scaffold counts will not be included.")
+        except Exception as e:
+            print(f"An error occurred while merging with the dataset summary: {e}")
+
+
         summary_df.to_csv(args.output_file, index=False)
         print(f"\nAnalysis complete. Summary saved to: {args.output_file}")
+        
+        # --- NEW: Calculate and print Pearson correlation ---
+        if 'num_scaffolds' in summary_df.columns and 'grokking_detected' in summary_df.columns:
+            # Ensure we have data to correlate
+            analysis_df = summary_df.dropna(subset=['num_scaffolds', 'grokking_detected'])
+            if len(analysis_df) > 2:
+                correlation, p_value = pearsonr(analysis_df['num_scaffolds'], analysis_df['grokking_detected'].astype(int))
+                print("\n--- Correlation Analysis ---")
+                print(f"Pearson correlation between Number of Scaffolds and Grokking Event (True/False):")
+                print(f"  - Correlation Coefficient: {correlation:.4f}")
+                print(f"  - P-value: {p_value:.4f}")
+                if p_value < 0.05:
+                    print("  - The correlation is statistically significant.")
+                else:
+                    print("  - The correlation is not statistically significant.")
+                print("--------------------------")
     else:
         print("\nNo valid runs with sufficient data were found to analyze.")
     print("\n--- Overall Analysis Statistics ---")
@@ -199,5 +186,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
