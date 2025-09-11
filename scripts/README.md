@@ -1,6 +1,8 @@
+Of course, here is the updated README.md with the Delta Lake creation step included.
+
 # Data Preparation and Analysis Pipeline
 
-We outline the steps to process protein-ligand data, from initial characterization to final analysis and visualization. The process is organized into a series of scripts that should be run sequentially.
+This document outlines the steps to process protein-ligand data, from initial characterization to final analysis and visualization. The process is organized into a series of scripts that should be run sequentially.
 
 -----
 
@@ -32,12 +34,26 @@ python cluster_and_select.py --metadata_file ../data/target_pocket_metadata.csv 
 
 ## 3\. Curriculum Build/Dataset Creation
 
-Now we build the datasets for each of the selected representative PDB IDs. The `run_curriculum_builder.py` script orchestrates this process by calling the `scaffold_splitter.py` script. This process involves filtering a large database of ligand information (BindingDB), splitting the data into training and testing sets based on molecular scaffolds, and saving them into individual directories for each target.
+### 3.1 Create Delta Lake from BindingDB
+
+Before building the individual datasets, we first process the raw BindingDB data into a Delta Lake. This provides a more efficient and queryable format for the next step. The `create_delta_lake.py` script handles this conversion.
 
 **Example:**
 
 ```bash
-python run_curriculum_builder.py BindingDB_All.tsv ../data/representative_pdb_ids.txt --output_dir datasets
+python create_delta_lake.py BindingDB_All.tsv --output_path bindingdb_delta
+```
+
+This will create a `bindingdb_delta` directory containing the Delta Lake.
+
+### 3.2 Dataset Creation
+
+Now we build the datasets for each of the selected representative PDB IDs. The `run_curriculum_builder.py` script orchestrates this process by calling the `scaffold_splitter.py` script. This process involves filtering the Delta Lake of ligand information, splitting the data into training and testing sets based on molecular scaffolds, and saving them into individual directories for each target.
+
+**Example:**
+
+```bash
+python run_curriculum_builder.py bindingdb_delta ../data/representative_pdb_ids.txt --output_dir datasets
 ```
 
 This will create a `datasets` directory containing subdirectories for each PDB ID, with `train.csv` and `test.csv` files inside each.
