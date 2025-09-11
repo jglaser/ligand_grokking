@@ -44,7 +44,6 @@ def process_and_save_target(args_tuple):
     Returns metadata upon completion.
     """
     pdb_id, target_name, lf, args = args_tuple
-    
     target_df_pd = lf.filter(pl.col("Target Name") == target_name).collect()
     if target_df_pd.is_empty():
         return None
@@ -117,7 +116,7 @@ def main():
     warnings.warn("Using robust Polars engine. Malformed rows may be skipped.")
     print(f"Pass 1: Mapping {len(args.pdb_ids)} PDB IDs to Target Names...")
 
-    activity_cols = tuple(col.strip() for col in args.activity_cols.strip(","))
+    activity_cols = tuple(col.strip() for col in args.activity_cols.split(","))
     pdb_regex = f"(?i)({'|'.join(args.pdb_ids)})"
     dl = pl.scan_delta(args.input_file).with_columns(pl.col("PDB ID(s) for Ligand-Target Complex").alias("pdb_id"))
 
