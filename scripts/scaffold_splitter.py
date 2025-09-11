@@ -66,11 +66,15 @@ def process_and_save_target(args_tuple):
         return None
 
     threshold = target_df['activity'].quantile(args.activity_percentile / 100.0)
-    
+
     df_final = target_df.copy()
     df_final['active'] = (df_final['activity'] < threshold).astype(int)
     # Use the canonical smiles column for splitting
     df_final = df_final[['ligand_name', 'smiles', 'active']]
+
+    # Limit the number of ligands per target by random sampling
+    if args.max_ligands and len(df_final) > args.max_ligands:
+        df_final = df_final.sample(n=args.max_ligands, random_state=42)
 
     train_df, test_df = create_scaffold_split(df_final, test_size=args.test_size)
 
@@ -79,7 +83,7 @@ def process_and_save_target(args_tuple):
 
     target_output_path = os.path.join(args.output_dir, pdb_id)
     os.makedirs(target_output_path, exist_ok=True)
-    
+
     train_file = os.path.join(target_output_path, "train.csv")
     test_file = os.path.join(target_output_path, "test.csv")
     train_df.to_csv(train_file, index=False, quoting=1)
@@ -106,13 +110,14 @@ def main():
     parser.add_argument("--activity_cols", type=str, default="Ki (nM),IC50 (nM),Kd (nM)", help='Comma-separated list of activity columns.')
     parser.add_argument("--activity_percentile", type=float, default=50.0, help="Activity percentile to define active compounds.")
     parser.add_argument("--test_size", type=float, default=0.2, help="Approximate fraction for the test set.")
+    parser.add_argument("--max_ligands", type=int, default=1000, help="Maximum number of ligands per target.")
     args = parser.parse_args()
 
     # --- Pass 1: Efficiently map PDB IDs to Target Names (unchanged) ---
     print(f"Pass 1: Mapping {len(args.pdb_ids)} PDB IDs to Target Names...")
     # (This section is unchanged and correct)
     pdb_regex = f"(?i)({'|'.join(args.pdb_ids)})"
-    
+
     try:
         q_map = (
             pl.scan_delta(args.input_file)
@@ -135,14 +140,14 @@ def main():
                 pdb_to_name_map[pdb_id] = target_name
                 if pdb_id not in name_to_pdb_map[target_name]:
                      name_to_pdb_map[target_name].append(pdb_id)
-    
+
     target_names_to_fetch = set(pdb_to_name_map.values())
     print(f"Mapped {len(pdb_to_name_map)} PDB IDs to {len(target_names_to_fetch)} unique target names.")
 
     # --- Pass 2: Lazily Fetch Data and then Pre-process SMILES in Parallel ---
     print(f"Pass 2: Lazily fetching data for {len(target_names_to_fetch)} targets...")
     activity_cols_list = [col.strip() for col in args.activity_cols.split(',')]
-    
+
     try:
         map_df = pl.DataFrame([
             {"Target Name": name, "pdb_id": pdb}
@@ -177,7 +182,7 @@ def main():
                 total=len(unique_smiles),
                 desc="Canonicalizing SMILES in parallel"
             ))
-        
+
         # Create a mapping from original to canonical SMILES
         smiles_map_df = pl.DataFrame(
             results,
@@ -199,7 +204,7 @@ def main():
             # Rename for consistency in the next step
             .rename({"canonical_smiles": "smiles"})
         )
-        
+
         processed_df = q_processed.collect().to_pandas()
         print(f"Processed down to {len(processed_df)} unique molecule-target-PDB triplets.")
 
@@ -220,7 +225,7 @@ def main():
             total=len(tasks),
             desc="Generating Datasets"
         ))
-    
+
     split_metadata = [meta for meta in results if meta]
 
     # --- Save Metadata Summary File ---
