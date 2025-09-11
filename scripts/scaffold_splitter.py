@@ -43,22 +43,18 @@ def process_and_save_target(args_tuple):
     Worker function to process a single target: filter, threshold, split, and save.
     Returns metadata upon completion.
     """
-    pdb_id, target_name, lf, args = args_tuple
-    
-    target_df_pd = lf.filter(pl.col("Target Name") == target_name).collect()
-    if target_df_pd.is_empty():
-        return None
+    pdb_id, target_name, id_target_df, args = args_tuple
 
-    threshold = target_df_pd.get_column("activity").quantile(args.activity_percentile / 100.0)
-    df = (
-        target_df_pd.with_columns(
+    threshold = id_target_df.get_column("activity").quantile(args.activity_percentile / 100.0)
+    df_to_split = (
+        id_target_df.with_columns(
             (pl.col("activity") < threshold).cast(pl.Int8).alias("active")
         )
         .select(["ligand_name", "smiles", "active"])
         .to_pandas()
     )
     
-    train_df, test_df = create_scaffold_split(df, test_size=args.test_size)
+    train_df, test_df = create_scaffold_split(df_to_split, test_size=args.test_size)
 
     if train_df.empty or test_df.empty:
         return None # Not enough data for a split
@@ -76,7 +72,7 @@ def process_and_save_target(args_tuple):
         'pdb_id': pdb_id,
         'target_name': target_name,
         'activity_threshold_nM': threshold,
-        'num_total_molecules': len(df),
+        'num_total_molecules': len(df_to_split),
         'num_train': len(train_df),
         'num_test': len(test_df)
     }
@@ -129,7 +125,7 @@ def main():
             pl.col("pdb_id").str.extract(f"{pdb_regex}", 0)
         )
     )
-    id_target_map = id_target_map_lf.collect().transpose().to_dict(as_series=False)
+    # id_target_map = id_target_map_lf.collect().transpose().to_dict(as_series=False)
 
     lf = (
         id_target_map_lf.join(dl, on="Target Name", how="left")
@@ -148,7 +144,9 @@ def main():
         )
     )
 
-    tasks = tuple((pdb_id, target, lf, args) for pdb_id, target in id_target_map.values())
+    df = lf.collect()
+    tasks = tuple((pdb_id, target, id_target_df, args) for (pdb_id, target), id_target_df in df.group_by(["pdb_id", "Target Name"]))
+    # tasks = tuple((pdb_id, target, df, args) for pdb_id, target in id_target_map.values())
 
     # --- Parallel Final Loop ---
     split_metadata = []
