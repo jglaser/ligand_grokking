@@ -87,20 +87,57 @@ def find_grokking_point_vectorized(epochs, train_acc, val_acc,
         # Memorized but no grokking event was found
         return memorization_epoch, -1
 
+def read_tensorboard_log(log_dir: str, cache_file: str = "scalars.parquet") -> pd.DataFrame:
+    """
+    Reads TensorBoard logs from a run directory. Uses a cached Parquet file if available
+    for speed. If no cache exists, parses the event files, saves a cache, and returns data.
+    """
+    cache_path = os.path.join(log_dir, cache_file)
 
-def read_tensorboard_log(log_dir: str) -> pd.DataFrame:
-    # ... (function is the same as before)
+    if os.path.exists(cache_path):
+        try:
+            return pd.read_parquet(cache_path)
+        except Exception as e:
+            print(f"Warning: Failed to read cache {cache_path} ({e}), falling back to event files.")
+
     try:
         from tensorboard.backend.event_processing import event_accumulator
-        ea = event_accumulator.EventAccumulator(log_dir, size_guidance={event_accumulator.SCALARS: 0})
+
+        ea = event_accumulator.EventAccumulator(
+            log_dir,
+            size_guidance={event_accumulator.SCALARS: 0}
+        )
         ea.Reload()
-        required_tags = {'train_accuracy', 'validation_accuracy'}
-        if not required_tags.issubset(ea.Tags()['scalars']): return None
-        df_train = pd.DataFrame([(e.step, e.value) for e in ea.Scalars('train_accuracy')], columns=['epoch', 'train_accuracy'])
-        df_val = pd.DataFrame([(e.step, e.value) for e in ea.Scalars('validation_accuracy')], columns=['epoch', 'validation_accuracy'])
-        history_df = pd.merge(df_train, df_val, on='epoch', how='outer').sort_values('epoch').ffill().dropna()
+
+        required_tags = {"train_accuracy", "validation_accuracy"}
+        if not required_tags.issubset(ea.Tags()["scalars"]):
+            return None
+
+        def scalars_to_df(tag, colname):
+            scalars = ea.Scalars(tag)
+            return pd.DataFrame({
+                "epoch": [e.step for e in scalars],
+                colname: [e.value for e in scalars]
+            })
+
+        df_train = scalars_to_df("train_accuracy", "train_accuracy")
+        df_val = scalars_to_df("validation_accuracy", "validation_accuracy")
+
+        history_df = (
+            pd.merge(df_train, df_val, on="epoch", how="outer")
+              .sort_values("epoch")
+              .ffill()
+              .dropna()
+        )
+        try:
+            history_df.to_parquet(cache_path, index=False)
+        except Exception as e:
+            print(f"Warning: Failed to write cache {cache_path} ({e}).")
+
         return history_df
-    except Exception:
+
+    except Exception as e:
+        print(f"Error reading TensorBoard log from {log_dir}: {e}")
         return None
 
 def analyze_log_worker(run_dir_path: str):
