@@ -125,7 +125,6 @@ def main():
             pl.col("pdb_id").str.extract(f"{pdb_regex}", 0)
         )
     )
-    # id_target_map = id_target_map_lf.collect().transpose().to_dict(as_series=False)
 
     lf = (
         id_target_map_lf.join(dl, on="Target Name", how="left")
@@ -145,8 +144,10 @@ def main():
     )
 
     df = lf.collect()
-    tasks = tuple((pdb_id, target, id_target_df, args) for (pdb_id, target), id_target_df in df.group_by(["pdb_id", "Target Name"]))
-    # tasks = tuple((pdb_id, target, df, args) for pdb_id, target in id_target_map.values())
+    tasks = tuple(
+        (pdb_id, target, id_target_df, args)
+        for (pdb_id, target), id_target_df in df.group_by(["pdb_id", "Target Name"])
+    )
 
     # --- Parallel Final Loop ---
     split_metadata = []
