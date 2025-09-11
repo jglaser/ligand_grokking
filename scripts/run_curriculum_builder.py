@@ -14,7 +14,7 @@ def main():
         formatter_class=argparse.RawTextHelpFormatter
     )
     parser.add_argument("binding_db_file", type=str, help="Path to the complete BindingDB TSV file.")
-    parser.add_argument("metadata_file", type=str, help="Path to the target_pocket_metadata.csv file.")
+    parser.add_argument("pdb_id_file", type=str, default="../data/representative_pdb_ids.txt", help="Path to the PDB ids list file.")
     parser.add_argument("--output_dir", type=str, default="datasets", help="Directory to save the generated dataset subdirectories.")
     parser.add_argument("--activity_percentile", type=float, default=50.0,
                         help="Activity percentile (0-100) to define the active/inactive threshold.\n"
@@ -28,10 +28,10 @@ def main():
         print(f"Created output directory: {args.output_dir}")
 
     # --- 2. Read Target PDB IDs from Metadata File ---
-    print(f"Reading target PDB IDs from {args.metadata_file}...")
+    print(f"Reading target PDB IDs from {args.pdb_id_file}...")
     try:
-        metadata_df = pl.read_csv(args.metadata_file)
-        pdb_ids_to_process = metadata_df['pdb_id'].unique().to_list()
+        index_df = pl.read_csv(args.pdb_id_file, has_header=False, new_columns=['pdb_id'])
+        pdb_ids_to_process = index_df['pdb_id'].unique().to_list()
         
     except Exception as e:
         print(f"Error reading metadata file: {e}")
