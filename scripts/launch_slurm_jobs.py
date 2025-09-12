@@ -21,11 +21,11 @@ def generate_slurm_script(job_name: str, account: str, time: str, nodes_per_job:
 #SBATCH --cpus-per-task=1
 #SBATCH --time={time}
 #SBATCH --array=1-{num_chunks}
-#SBATCH -o slurm/%x-%A_%a.out
-#SBATCH -e slurm/%x-%A_%a.err
+#SBATCH -o slurm/%A_%a.out
+#SBATCH -e slurm/%A_%a.err
 
 # --- Environment Setup (MODIFY THIS SECTION) ---
-# Your environment setup goes here
+# ...
 
 echo "Job Array Task $SLURM_ARRAY_TASK_ID starting on $(hostname)"
 echo "SLURM Job ID: $SLURM_JOB_ID"

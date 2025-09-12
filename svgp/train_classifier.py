@@ -119,21 +119,21 @@ def featurize_smiles(smiles_list, model_name, batch_size=64, max_length=512):
     return np.vstack(all_features)
 
 # --- Logging Callback ---
-def log_callback_factory(X_train, y_train, X_val, y_val, logger):
+def log_callback_factory(X_train, y_train, X_val, y_val, logger, log_interval=100):
     def log_callback(model, epoch, metrics, params, bias_state):
-        if epoch % 100 == 0:
+        if epoch % log_interval == 0:
             val_score = model.score(X_val, y_val, params=params)
             metrics["validation_accuracy"] = val_score
             train_subset_idx = np.random.choice(X_train.shape[0], size=min(len(y_val), len(y_train)), replace=False)
             X_train_subset, y_train_subset = X_train[train_subset_idx], y_train[train_subset_idx]
             train_score = model.score(X_train_subset, y_train_subset, params=params)
             metrics["train_accuracy"] = train_score
-        if epoch % 100 == 0 and 'encoder_params' in params and 'W' in params['encoder_params']:
+        if epoch % log_interval == 0 and 'encoder_params' in params and 'W' in params['encoder_params']:
             svals = jnp.linalg.svd(params['encoder_params']['W'], compute_uv=False)
             metrics['htsr_alpha'] = estimate_alpha_fit(svals**2)
         
         # Use the logger object to log the metrics
-        if epoch % 100 == 0:
+        if epoch % log_interval == 0:
             logger.log(metrics, step=epoch)
         return metrics # Return for progress bar
     return log_callback
@@ -156,6 +156,7 @@ def main():
     
     # --- New/Modified Logging Arguments ---
     parser.add_argument("--logger", type=str, default="tensorboard", choices=["tensorboard", "wandb"], help="Logging backend to use.")
+    parser.add_argument("--log_interval", type=int, default=100, help="Number of epochs between logging steps.")
     parser.add_argument("--log_dir", type=str, default="logs", help="Directory for TensorBoard logs.")
     parser.add_argument("--wandb_project", type=str, default="grokking_chemistry", help="Weights & Biases project name.")
     parser.add_argument("--wandb_run_name", type=str, default="experiment", help="A name for this specific W&B run.")
@@ -185,7 +186,7 @@ def main():
         y_test = x_test_df['active'].to_numpy()
 
         # --- Setup and Train Model ---
-        callback = log_callback_factory(X_train, y_train, X_test, y_test, logger)
+        callback = log_callback_factory(X_train, y_train, X_test, y_test, logger, args.log_interval)
         key, encoder_key, hparam_key = jax.random.split(key, 3)
         encoder = LinearEncoder(encoder_key, X_train.shape[-1], args.encoder_dim)
         

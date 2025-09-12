@@ -11,7 +11,7 @@ def run_training_task(task_tuple):
     It's executed by a worker process in the MPI pool.
     """
     # Unpack the full tuple, which now includes non-swept campaign parameters
-    task_line, datasets_dir, epochs, n_inducing_points, wandb_project, logger, log_dir = task_tuple
+    task_line, datasets_dir, epochs, n_inducing_points, wandb_project, logger, log_interval, log_dir = task_tuple
     comm = MPI.COMM_WORLD
     rank = comm.Get_rank()
     local_rank = int(os.environ.get('SLURM_LOCALID', rank % 8))
@@ -44,6 +44,7 @@ def run_training_task(task_tuple):
             "--n_inducing_points", str(n_inducing_points),
             "--epochs", str(epochs),
             "--logger", logger,
+            "--log_interval", str(log_interval),
             "--log_dir", log_dir
         ]
         subprocess.run(command, check=True)
@@ -62,6 +63,7 @@ def main():
     parser.add_argument("--n_inducing_points", type=int, default=100)
     parser.add_argument("--wandb_project", type=str, default="grok_pdbbind")
     parser.add_argument("--logger", type=str, default="tensorboard", choices=["tensorboard", "wandb"])
+    parser.add_argument("--log_interval", type=int, default=1000, choices=["tensorboard", "wandb"])
     parser.add_argument("--log_dir", type=str, default="logs", help="Base directory for local TensorBoard logs.")
 
     args = parser.parse_args()
@@ -86,6 +88,7 @@ def main():
                     repeat(args.n_inducing_points),
                     repeat(args.wandb_project),
                     repeat(args.logger),
+                    repeat(args.log_interval),
                     repeat(args.log_dir)
                 )
                 results = executor.map(run_training_task, task_tuples)
