@@ -10,47 +10,44 @@ from rdkit import Chem
 from rdkit.Chem.Scaffolds import MurckoScaffold
 from tqdm.auto import tqdm
 
-def canonicalize_smiles(smiles: str) -> str:
+# --- Worker functions for parallel processing (must be at top level) ---
+def canonicalize_smiles_worker(smiles: str) -> str:
     """Canonicalizes a single SMILES string."""
-    mol = Chem.MolFromSmiles(smiles)
-    if mol is None:
+    try:
+        mol = Chem.MolFromSmiles(smiles)
+        if mol:
+            return Chem.MolToSmiles(mol, canonical=True)
         return None
-    return Chem.MolToSmiles(mol, canonical=True)
+    except:
+        return None
 
-def canonicalize_batch(batch_df: pl.DataFrame) -> pl.DataFrame:
-    smiles_list = batch_df["smiles"].to_list()
-    canonical_list = [canonicalize_smiles(s) for s in smiles_list]
-    return batch_df.with_columns(pl.Series("smiles", canonical_list))
-
-def get_scaffold(smiles_string: str) -> str | None:
-    """
-    Computes the Murcko scaffold for a given SMILES string.
-    Returns the canonical SMILES of the scaffold, or None if invalid.
-    """
+def get_scaffold(smiles_string: str) -> str:
+    """Computes the Murcko scaffold for a given SMILES string."""
     try:
         mol = Chem.MolFromSmiles(smiles_string)
-        if mol is None:
-            return None
-        scaffold = MurckoScaffold.GetScaffoldForMol(mol)
-        if scaffold is None:
-            return None
-        return Chem.MolToSmiles(scaffold, canonical=True)
-    except Exception:
-        return None
+        if mol:
+            scaffold = MurckoScaffold.GetScaffoldForMol(mol)
+            return Chem.MolToSmiles(scaffold, canonical=True)
+        return ""
+    except:
+        return ""
 
 def process_and_save_target(args_tuple):
     """
     Worker function to process a single target: filter, threshold, split, and save.
     Returns metadata upon completion.
     """
-    pdb_id, target_name, id_target_df, args = args_tuple
+    pdb_id, target_name, deduplicated_pd, args = args_tuple
+    
+    target_df_pd = deduplicated_pd[deduplicated_pd["Target Name"] == target_name].copy()
+    if target_df_pd.empty:
+        return None
 
-    threshold = id_target_df["activity"].quantile(args.activity_percentile / 100.0)
-    df_to_split = id_target_df.copy()
-    df_to_split['active'] = df_to_split['activity'] < threshold
-    df_to_split = df_to_split[["ligand_name", "smiles", "active"]]
-
-    train_df, test_df = create_scaffold_split(df_to_split, test_size=args.test_size)
+    threshold = target_df_pd['activity'].quantile(args.activity_percentile / 100.0)
+    target_df_pd['active'] = (target_df_pd['activity'] < threshold).astype(int)
+    
+    final_df = target_df_pd[['name', 'smiles', 'active']]
+    train_df, test_df = create_scaffold_split(final_df, test_size=args.test_size)
 
     if train_df.empty or test_df.empty:
         return None # Not enough data for a split
@@ -68,10 +65,20 @@ def process_and_save_target(args_tuple):
         'pdb_id': pdb_id,
         'target_name': target_name,
         'activity_threshold_nM': threshold,
-        'num_total_molecules': len(df_to_split),
+        'num_total_molecules': len(final_df),
         'num_train': len(train_df),
         'num_test': len(test_df)
     }
+
+def parallel_canonicalize(smiles_series: pd.Series) -> list:
+    """Canonicalizes a pandas Series of SMILES strings in parallel."""
+    with Pool(cpu_count()) as p:
+        canonical_smiles_list = list(tqdm(
+            p.imap(canonicalize_smiles_worker, smiles_series, chunksize=1000),
+            total=len(smiles_series),
+            desc="Canonicalizing SMILES"
+        ))
+    return canonical_smiles_list
 
 def create_scaffold_split(df: pd.DataFrame, test_size: float = 0.2):
     """Splits a DataFrame into training and test sets based on molecular scaffolds."""
@@ -104,57 +111,79 @@ def main():
     parser.add_argument("--activity_percentile", type=float, default=50.0, help="Activity percentile to define active compounds.")
     parser.add_argument("--test_size", type=float, default=0.2, help="Approximate fraction for the test set.")
     args = parser.parse_args()
-    
+
     # --- The rest of the main function, now with parallel processing for the final loop ---
     warnings.warn("Using robust Polars engine. Malformed rows may be skipped.")
-    print(f"Pass 1: Mapping {len(args.pdb_ids)} PDB IDs to Target Names...")
-
-    activity_cols = tuple(col.strip() for col in args.activity_cols.split(","))
+    print(f"Mapping {len(args.pdb_ids)} PDB IDs to Target Names...")
     pdb_regex = f"(?i)({'|'.join(args.pdb_ids)})"
-    dl = pl.scan_delta(args.input_file).with_columns(pl.col("PDB ID(s) for Ligand-Target Complex").alias("pdb_id"))
 
-    dl_filt = dl.filter(pl.col("pdb_id").str.contains(pdb_regex)).collect()
-
-    id_target_map = (
-        dl_filt
-        .select(["pdb_id", "Target Name"])
-        .unique()
-        .with_columns(
-            pl.col("pdb_id").str.extract(f"{pdb_regex}", 0)
+    inp = pl.scan_csv(args.input_file, separator='\t', ignore_errors=True, truncate_ragged_lines=True, quote_char=None)
+    try:
+        q_map = (
+            inp
+            .filter(pl.col("PDB ID(s) for Ligand-Target Complex").str.contains(pdb_regex))
+            .select(["PDB ID(s) for Ligand-Target Complex", "Target Name"])
+            .unique()
         )
-    )
+    except Exception as e:
+        print(f"Polars scan for mapping failed: {e}")
+        return
 
-    df = (
-        id_target_map.join(dl_filt, on="Target Name", how="left")
-        .with_columns(
-            pl.col("BindingDB Ligand Name").alias("ligand_name"),
-            pl.col("Ligand SMILES").alias("smiles"),
-            pl.min_horizontal(activity_cols).alias("activity"),
+    try:
+        activity_cols_list = [col.strip() for col in args.activity_cols.split(',')]
+        cols = pl.scan_csv(args.input_file, separator='\t', n_rows=1).collect_schema().names()
+
+        inp_filter = (inp
+                .rename({'BindingDB Ligand Name': 'name', 'Ligand SMILES': 'smiles'})
+                .with_columns(
+                    pl.coalesce([
+                        pl.col(col).str.replace_all(r"[<>]", "").cast(pl.Float64, strict=False)
+                        for col in activity_cols_list if col in cols
+                    ]).alias("activity")
+                )
+                .filter(pl.col("smiles").is_not_null() & pl.col("activity").is_not_null())
+                .select(["activity", "smiles", "Target Name", "name"])
         )
-        .select(["pdb_id", "Target Name", "smiles", "ligand_name", "activity"])
-        #.map_batches(canonicalize_batch)
-        .filter(pl.col("smiles").is_not_null())
-        .group_by(["pdb_id", "Target Name", "smiles"])
-        .agg(
-            pl.col("activity").median(),
-            pl.col("ligand_name").first()
+
+        q_expand = (
+            inp_filter
+            .join(q_map, on="Target Name", how='semi')
         )
-        .filter(pl.col("activity").is_not_null())
-    )
+        all_targets_df_pl = q_expand.collect()
+    except Exception as e:
+        print(f"Polars processing failed: {e}")
+        return
 
-    tasks = tuple(
-        (pdb_id, target, id_target_df.to_pandas(), args)
-        for (pdb_id, target), id_target_df in df.group_by(["pdb_id", "Target Name"])
-    )
+    if all_targets_df_pl.is_empty():
+        print("No valid entries found for any of the identified target names.")
+        return
 
+    print(f"Found {len(all_targets_df_pl)} raw valid entries.")
+
+    canonical_smiles = parallel_canonicalize(all_targets_df_pl['smiles'].to_pandas())
+    all_targets_df_pl = all_targets_df_pl.with_columns(pl.Series("canonical_smiles", canonical_smiles)).drop_nulls("canonical_smiles")
+
+    deduplicated_df = all_targets_df_pl.group_by(['Target Name', 'canonical_smiles']).agg(
+        pl.col('activity').median().alias('activity'),
+        pl.col('name').first().alias('name')
+    ).rename({'canonical_smiles': 'smiles'})
+    print(f"Processed down to {len(deduplicated_df)} unique molecule-target pairs.")
+    deduplicated_pd = deduplicated_df.to_pandas()
+    
     # --- Parallel Final Loop ---
+    tasks = []
+    for pdb_id in args.pdb_ids:
+        target_name = pdb_to_name_map.get(pdb_id)
+        if target_name:
+            tasks.append((pdb_id, target_name, deduplicated_pd, args))
+
     split_metadata = []
     print(f"\nGenerating individual datasets for {len(tasks)} targets in parallel...")
     with Pool(cpu_count()) as p:
         results = list(tqdm(
             p.imap(process_and_save_target, tasks),
             total=len(tasks),
-            desc="Generating Datasets in Parallel"
+            desc="Generating Datasets"
         ))
     
     for meta in results:
