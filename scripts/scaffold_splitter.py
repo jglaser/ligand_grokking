@@ -47,6 +47,11 @@ def process_and_save_target(args_tuple):
     target_df_pd['active'] = (target_df_pd['activity'] < threshold).astype(int)
     
     final_df = target_df_pd[['ligand_name', 'smiles', 'active']]
+
+    # Limit the number of ligands per target by random sampling
+    if args.max_ligands and len(final_df) > args.max_ligands:
+        final_df = final_df.sample(n=args.max_ligands, random_state=42)
+
     train_df, test_df = create_scaffold_split(final_df, test_size=args.test_size)
 
     if train_df.empty or test_df.empty:
@@ -69,16 +74,6 @@ def process_and_save_target(args_tuple):
         'num_train': len(train_df),
         'num_test': len(test_df)
     }
-
-def parallel_canonicalize(smiles_series: pd.Series) -> list:
-    """Canonicalizes a pandas Series of SMILES strings in parallel."""
-    with Pool(cpu_count()) as p:
-        canonical_smiles_list = list(tqdm(
-            p.imap(canonicalize_smiles_worker, smiles_series, chunksize=1000),
-            total=len(smiles_series),
-            desc="Canonicalizing SMILES"
-        ))
-    return canonical_smiles_list
 
 def create_scaffold_split(df: pd.DataFrame, test_size: float = 0.2):
     """Splits a DataFrame into training and test sets based on molecular scaffolds."""
@@ -110,6 +105,8 @@ def main():
     parser.add_argument("--activity_cols", type=str, default="Ki (nM),IC50 (nM),Kd (nM)", help='Comma-separated list of activity columns.')
     parser.add_argument("--activity_percentile", type=float, default=50.0, help="Activity percentile to define active compounds.")
     parser.add_argument("--test_size", type=float, default=0.2, help="Approximate fraction for the test set.")
+    parser.add_argument("--max_ligands", type=int, default=1000, help="Maximum number of ligands per target.")
+
     args = parser.parse_args()
 
     # --- The rest of the main function, now with parallel processing for the final loop ---
@@ -130,30 +127,38 @@ def main():
         )
     )
 
-    print(name.collect())
+    def canonicalize_list(smiles_list: list[str]) -> list:
+        with Pool(cpu_count()) as pool:
+            return pool.map(canonicalize_smiles, smiles_list)
+
+    lf_can = (
+        name
+        .join(dl, on="Target Name", how="left")
+        .with_columns(
+            pl.col("BindingDB Ligand Name").alias("ligand_name"),
+            pl.col("Ligand SMILES").alias("smiles"),
+        )
+        .select(["smiles", "ligand_name"])
+        .filter(pl.col("smiles").is_not_null())
+        .unique("smiles")
+    )
+
+    smiles_can = canonicalize_list(lf_can.select("smiles").collect().to_series().to_list())
+    lf_can = lf_can.with_columns(pl.Series("smiles", smiles_can))
 
     lf = (
         name
         .join(dl, on="Target Name", how="left")
         .with_columns(
             pl.col("BindingDB Ligand Name").alias("ligand_name"),
-            pl.col("Ligand SMILES").alias("smiles"),
             pl.min_horizontal(args.activity_cols.split(',')).alias("activity"),
         )
-        .select(["pdb_id", "Target Name", "smiles", "ligand_name", "activity"])
-        .filter(pl.col("smiles").is_not_null())
+        .select(["pdb_id", "Target Name", "ligand_name", "activity"])
+        .join(lf_can, on="ligand_name", how="left")
     )
-    def canonicalize_list(smiles_list: list[str]) -> list:
-        with Pool(cpu_count()) as pool:
-            return pool.map(canonicalize_smiles, smiles_list)
-
-    canonical_smiles = canonicalize_list(lf.select("smiles").collect().to_series().to_list())
 
     lf2 = (
         lf
-        .with_columns(
-            pl.Series("smiles", canonical_smiles)
-        )
         .group_by(["pdb_id", "Target Name", "smiles"])
         .agg(
             pl.col("activity").median().alias("activity"),
@@ -161,9 +166,6 @@ def main():
         )
         .filter(pl.col("smiles").is_not_null() & pl.col("activity").is_not_null())
     )
-    print(lf2.collect())
-    print(lf2.drop_nulls().collect())
-    # print(lf2.select(pl.len()).collect())
 
     df = lf2.collect()
     tasks = [(pdb_id, target, sub_df.to_pandas(), args) for (pdb_id, target), sub_df in df.group_by(["pdb_id", "Target Name"])]
@@ -174,14 +176,14 @@ def main():
         results = list(tqdm(
             p.imap(process_and_save_target, tasks),
             total=len(tasks),
-            desc="Generating Datasets"
+            desc="Generating datasets"
         ))
 
     for meta in results:
         if meta:
             split_metadata.append(meta)
 
-    # --- Save Metadata Summary File ---
+    # --- save metadata summary file ---
     if split_metadata:
         summary_df = pd.DataFrame(split_metadata)
         summary_file_path = os.path.join(args.output_dir, args.summary_file)
