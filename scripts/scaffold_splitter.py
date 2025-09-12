@@ -11,7 +11,7 @@ from rdkit.Chem.Scaffolds import MurckoScaffold
 from tqdm.auto import tqdm
 
 # --- Worker functions for parallel processing (must be at top level) ---
-def canonicalize_smiles_worker(smiles: str) -> str:
+def canonicalize_smiles(smiles: str) -> str:
     """Canonicalizes a single SMILES string."""
     try:
         mol = Chem.MolFromSmiles(smiles)
@@ -46,7 +46,7 @@ def process_and_save_target(args_tuple):
     threshold = target_df_pd['activity'].quantile(args.activity_percentile / 100.0)
     target_df_pd['active'] = (target_df_pd['activity'] < threshold).astype(int)
     
-    final_df = target_df_pd[['name', 'smiles', 'active']]
+    final_df = target_df_pd[['ligand_name', 'smiles', 'active']]
     train_df, test_df = create_scaffold_split(final_df, test_size=args.test_size)
 
     if train_df.empty or test_df.empty:
@@ -103,7 +103,7 @@ def create_scaffold_split(df: pd.DataFrame, test_size: float = 0.2):
 def main():
     parser = argparse.ArgumentParser(description="Filter BindingDB for a list of PDB IDs and create scaffold-based train/test splits.")
     # ... (parser arguments remain the same)
-    parser.add_argument("input_file", type=str, help="Path to the complete BindingDB TSV file.")
+    parser.add_argument("input_directory", type=str, help="Path to the complete BindingDB Delta lake.")
     parser.add_argument("--pdb_ids", type=str, nargs='+', required=True, help="A list of PDB IDs to filter for.")
     parser.add_argument("--output_dir", type=str, required=True, help="Directory to save the generated dataset subdirectories.")
     parser.add_argument("--summary_file", type=str, default="dataset_split_summary.csv", help="Name for the output summary CSV file.")
@@ -115,79 +115,58 @@ def main():
     # --- The rest of the main function, now with parallel processing for the final loop ---
     warnings.warn("Using robust Polars engine. Malformed rows may be skipped.")
     print(f"Mapping {len(args.pdb_ids)} PDB IDs to Target Names...")
-    pdb_regex = f"(?i)({'|'.join(args.pdb_ids)})"
+    pattern = f"(?i)({'|'.join([s.upper() for s in args.pdb_ids])})"
 
-    inp = pl.scan_csv(args.input_file, separator='\t', ignore_errors=True, truncate_ragged_lines=True, quote_char=None)
-    try:
-        q_map = (
-            inp
-            .filter(pl.col("PDB ID(s) for Ligand-Target Complex").str.contains(pdb_regex))
-            .select(["PDB ID(s) for Ligand-Target Complex", "Target Name"])
-            .unique()
+    ltc = "PDB ID(s) for Ligand-Target Complex"
+    dl = pl.scan_delta(args.input_directory).with_columns(pl.col(ltc).alias("pdb_id"))
+
+    name = (
+        dl
+        .filter(pl.col("pdb_id").str.contains(pattern))
+        .select(["pdb_id", "Target Name"])
+        .unique()
+        .with_columns(
+            pl.col("pdb_id").str.extract(f"{pattern}", 0)
         )
-        mapping_df_pd = q_map.collect().to_pandas()
-    except Exception as e:
-        print(f"Polars scan for mapping failed: {e}")
-        return
+    )
 
-    pdb_to_name_map = {}
-    target_names_to_fetch = set()
-    for _, row in mapping_df_pd.iterrows():
-        pdb_id_str = row["PDB ID(s) for Ligand-Target Complex"]
-        target_name = row["Target Name"]
-        for pdb_id in args.pdb_ids:
-            if pdb_id.lower() in pdb_id_str.lower():
-                pdb_to_name_map[pdb_id] = target_name
-                target_names_to_fetch.add(target_name)
+    print(name.collect())
 
-    try:
-        activity_cols_list = [col.strip() for col in args.activity_cols.split(',')]
-        cols = pl.scan_csv(args.input_file, separator='\t', n_rows=1).collect_schema().names()
-
-        inp_filter = (inp
-                .rename({'BindingDB Ligand Name': 'name', 'Ligand SMILES': 'smiles'})
-                .with_columns(
-                    pl.coalesce([
-                        pl.col(col).str.replace_all(r"[<>]", "").cast(pl.Float64, strict=False)
-                        for col in activity_cols_list if col in cols
-                    ]).alias("activity")
-                )
-                .filter(pl.col("smiles").is_not_null() & pl.col("activity").is_not_null())
-                .select(["activity", "smiles", "Target Name", "name"])
+    lf = (
+        name
+        .join(dl, on="Target Name", how="left")
+        .with_columns(
+            pl.col("BindingDB Ligand Name").alias("ligand_name"),
+            pl.col("Ligand SMILES").alias("smiles"),
+            pl.min_horizontal(args.activity_cols.split(',')).alias("activity"),
         )
+        .select(["pdb_id", "Target Name", "smiles", "ligand_name", "activity"])
+        .filter(pl.col("smiles").is_not_null())
+    )
+    def canonicalize_list(smiles_list: list[str]) -> list:
+        with Pool(cpu_count()) as pool:
+            return pool.map(canonicalize_smiles, smiles_list)
 
-        q_expand = (
-            inp_filter
-            .join(q_map, on="Target Name", how='semi')
+    canonical_smiles = canonicalize_list(lf.select("smiles").collect().to_series().to_list())
+
+    lf2 = (
+        lf
+        .with_columns(
+            pl.Series("smiles", canonical_smiles)
         )
-        all_targets_df_pl = q_expand.collect()
-        print(all_targets_df_pl)
-    except Exception as e:
-        print(f"Polars processing failed: {e}")
-        return
+        .group_by(["pdb_id", "Target Name", "smiles"])
+        .agg(
+            pl.col("activity").median().alias("activity"),
+            pl.col("ligand_name").first(),
+        )
+        .filter(pl.col("smiles").is_not_null() & pl.col("activity").is_not_null())
+    )
+    print(lf2.collect())
+    print(lf2.drop_nulls().collect())
+    # print(lf2.select(pl.len()).collect())
 
-    if all_targets_df_pl.is_empty():
-        print("No valid entries found for any of the identified target names.")
-        return
-
-    print(f"Found {len(all_targets_df_pl)} raw valid entries.")
-
-    canonical_smiles = parallel_canonicalize(all_targets_df_pl['smiles'].to_pandas())
-    all_targets_df_pl = all_targets_df_pl.with_columns(pl.Series("canonical_smiles", canonical_smiles)).drop_nulls("canonical_smiles")
-
-    deduplicated_df = all_targets_df_pl.group_by(['Target Name', 'canonical_smiles']).agg(
-        pl.col('activity').median().alias('activity'),
-        pl.col('name').first().alias('name')
-    ).rename({'canonical_smiles': 'smiles'})
-    print(f"Processed down to {len(deduplicated_df)} unique molecule-target pairs.")
-    deduplicated_pd = deduplicated_df.to_pandas()
-    
-    # --- Parallel Final Loop ---
-    tasks = []
-    for pdb_id in args.pdb_ids:
-        target_name = pdb_to_name_map.get(pdb_id)
-        if target_name:
-            tasks.append((pdb_id, target_name, deduplicated_pd, args))
+    df = lf2.collect()
+    tasks = [(pdb_id, target, sub_df.to_pandas(), args) for (pdb_id, target), sub_df in df.group_by(["pdb_id", "Target Name"])]
 
     split_metadata = []
     print(f"\nGenerating individual datasets for {len(tasks)} targets in parallel...")
@@ -197,7 +176,7 @@ def main():
             total=len(tasks),
             desc="Generating Datasets"
         ))
-    
+
     for meta in results:
         if meta:
             split_metadata.append(meta)
