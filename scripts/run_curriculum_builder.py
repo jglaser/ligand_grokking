@@ -19,6 +19,8 @@ def main():
     parser.add_argument("--activity_percentile", type=float, default=50.0,
                         help="Activity percentile (0-100) to define the active/inactive threshold.\n"
                              "Default is 50.0 (the median).")
+    parser.add_argument("--max_scaffolds", type=int, default=None, help="Maximum number of Murcko scaffolds to include per target.")
+
 
     args = parser.parse_args()
 
@@ -51,7 +53,10 @@ def main():
         "--activity_percentile", str(args.activity_percentile),
         "--pdb_ids", *pdb_ids_to_process  # Unpack the list of PDB IDs
     ]
-    
+   
+    if args.max_scaffolds is not None:
+        command += ["--max_scaffolds", str(args.max_scaffolds) ]
+
     print("\nCalling the dataset builder to process all targets in a single run...")
     try:
         # Using subprocess.run without capturing output to stream stdout/stderr
