@@ -125,9 +125,20 @@ def main():
             .select(["PDB ID(s) for Ligand-Target Complex", "Target Name"])
             .unique()
         )
+        mapping_df_pd = q_map.collect().to_pandas()
     except Exception as e:
         print(f"Polars scan for mapping failed: {e}")
         return
+
+    pdb_to_name_map = {}
+    target_names_to_fetch = set()
+    for _, row in mapping_df_pd.iterrows():
+        pdb_id_str = row["PDB ID(s) for Ligand-Target Complex"]
+        target_name = row["Target Name"]
+        for pdb_id in args.pdb_ids:
+            if pdb_id.lower() in pdb_id_str.lower():
+                pdb_to_name_map[pdb_id] = target_name
+                target_names_to_fetch.add(target_name)
 
     try:
         activity_cols_list = [col.strip() for col in args.activity_cols.split(',')]
@@ -150,6 +161,7 @@ def main():
             .join(q_map, on="Target Name", how='semi')
         )
         all_targets_df_pl = q_expand.collect()
+        print(all_targets_df_pl)
     except Exception as e:
         print(f"Polars processing failed: {e}")
         return
