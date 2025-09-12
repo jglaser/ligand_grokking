@@ -5,6 +5,7 @@ import jax
 import jax.numpy as jnp
 from tqdm.auto import tqdm
 import os
+import csv
 
 # --- Logger Abstraction ---
 # This allows us to easily switch between different logging backends.
@@ -66,6 +67,28 @@ class TensorBoardLogger(BaseLogger):
         if self.writer:
             self.writer.close()
             print(f"TensorBoard log for '{self.run_name}' closed.")
+
+class CSVLogger(BaseLogger):
+    def __init__(self, config, run_name, log_dir="logs"):
+        super().__init__(config, run_name)
+        log_path = os.path.join(log_dir, f"{run_name}.csv")
+        self.log_file = open(log_path, 'w', newline='')
+        self.writer = None
+        self.header_written = False
+
+    def log(self, metrics, step):
+        if not self.header_written:
+            self.writer = csv.DictWriter(self.log_file, fieldnames=['epoch'] + list(metrics.keys()))
+            self.writer.writeheader()
+            self.header_written = True
+        
+        log_data = {'epoch': step, **metrics}
+        self.writer.writerow(log_data)
+
+    def finish(self):
+        if self.log_file:
+            self.log_file.close()
+            print(f"CSV log for '{self.run_name}' closed.")
 
 # --- The rest of the script remains largely the same ---
 # (Featurizer, Encoder, Alpha estimation, etc.)
@@ -155,9 +178,9 @@ def main():
     parser.add_argument("--random_seed", type=int, default=42)
     
     # --- New/Modified Logging Arguments ---
-    parser.add_argument("--logger", type=str, default="tensorboard", choices=["tensorboard", "wandb"], help="Logging backend to use.")
+    parser.add_argument("--logger", type=str, default="csv", choices=["tensorboard", "wandb", "csv"], help="Logging backend to use.")
     parser.add_argument("--log_interval", type=int, default=100, help="Number of epochs between logging steps.")
-    parser.add_argument("--log_dir", type=str, default="logs", help="Directory for TensorBoard logs.")
+    parser.add_argument("--log_dir", type=str, default="logs", help="Directory for TensorBoard or CSV logs.")
     parser.add_argument("--wandb_project", type=str, default="grokking_chemistry", help="Weights & Biases project name.")
     parser.add_argument("--wandb_run_name", type=str, default="experiment", help="A name for this specific W&B run.")
 
@@ -167,8 +190,10 @@ def main():
     # --- Setup Logger ---
     if args.logger == "wandb":
         logger = WandbLogger(config=vars(args), run_name=args.wandb_run_name, project_name=args.wandb_project)
-    else: # tensorboard
+    elif args.logger == "tensorboard":
         logger = TensorBoardLogger(config=vars(args), run_name=args.wandb_run_name, log_dir=args.log_dir)
+    else: # csv
+        logger = CSVLogger(config=vars(args), run_name=args.wandb_run_name, log_dir=args.log_dir)
 
     # --- THE FIX: Use a try...finally block to guarantee logger cleanup ---
     try:
@@ -213,5 +238,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
-

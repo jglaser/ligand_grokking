@@ -103,11 +103,24 @@ def read_tensorboard_log(log_dir: str) -> pd.DataFrame:
     except Exception:
         return None
 
-def analyze_log_worker(run_dir_path: str):
-    # ... (function is the same as before)
-    run_name = os.path.basename(run_dir_path)
+def read_csv_log(log_file: str) -> pd.DataFrame:
     try:
-        history = read_tensorboard_log(run_dir_path)
+        df = pd.read_csv(log_file)
+        required_cols = {'epoch', 'train_accuracy', 'validation_accuracy'}
+        if not required_cols.issubset(df.columns):
+            return None
+        return df[['epoch', 'train_accuracy', 'validation_accuracy']].dropna()
+    except Exception:
+        return None
+
+def analyze_log_worker(log_path: str):
+    run_name = os.path.basename(log_path).replace('.csv', '')
+    try:
+        if log_path.endswith('.csv'):
+            history = read_csv_log(log_path)
+        else:
+            history = read_tensorboard_log(log_path)
+        
         if history is None: return {'run_name': run_name, 'status': 'failed_read'}
         if history.empty or len(history) < 100: return {'run_name': run_name, 'status': 'too_short'}
         mem_epoch, grok_epoch = find_grokking_point_vectorized(history["epoch"].values, history["train_accuracy"].values, history["validation_accuracy"].values)
@@ -118,19 +131,23 @@ def analyze_log_worker(run_dir_path: str):
         return {'run_name': run_name, 'status': 'failed_read'}
 
 def main():
-    parser = argparse.ArgumentParser(description="Analyze a directory of TensorBoard logs for grokking events.")
-    # ... (parser args are the same as before)
-    parser.add_argument("log_dir", type=str, help="Path to the local TensorBoard log directory ('logs/').")
+    parser = argparse.ArgumentParser(description="Analyze a directory of logs for grokking events.")
+    parser.add_argument("log_dir", type=str, help="Path to the local log directory ('logs/').")
     parser.add_argument("dataset_summary_file", type=str, help="Path to the dataset_split_summary.csv file.")
     parser.add_argument("--output_file", type=str, default="grokking_analysis_summary.csv", help="Name for the output summary CSV file.")
     args = parser.parse_args()
     
-    run_dirs = [os.path.join(args.log_dir, d) for d in sorted(os.listdir(args.log_dir)) if os.path.isdir(os.path.join(args.log_dir, d))]
-    print(f"Found {len(run_dirs)} potential runs in '{args.log_dir}'. Analyzing in parallel...")
-    stats = {'total_runs': len(run_dirs), 'failed_reads': 0, 'too_short': 0, 'analyzed_runs': 0, 'grokking_runs': 0}
+    log_files = []
+    for f in sorted(os.listdir(args.log_dir)):
+        path = os.path.join(args.log_dir, f)
+        if os.path.isdir(path) or f.endswith('.csv'):
+            log_files.append(path)
+
+    print(f"Found {len(log_files)} potential runs in '{args.log_dir}'. Analyzing in parallel...")
+    stats = {'total_runs': len(log_files), 'failed_reads': 0, 'too_short': 0, 'analyzed_runs': 0, 'grokking_runs': 0}
     successful_results = []
     with Pool(cpu_count()) as p:
-        results = list(tqdm(p.imap(analyze_log_worker, run_dirs), total=len(run_dirs), desc="Analyzing Logs"))
+        results = list(tqdm(p.imap(analyze_log_worker, log_files), total=len(log_files), desc="Analyzing Logs"))
     for result in results:
         if result is None: stats['failed_reads'] += 1; continue
         status = result.get('status', 'failed_read')
