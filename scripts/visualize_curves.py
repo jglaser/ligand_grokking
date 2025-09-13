@@ -6,21 +6,17 @@ import seaborn as sns
 import matplotlib.pyplot as plt
 from tqdm.auto import tqdm
 
-def read_tensorboard_log(log_dir: str) -> pd.DataFrame:
-    """Reads scalar data from a TensorBoard log directory into a pandas DataFrame."""
+def read_csv_log(log_path: str) -> pd.DataFrame:
+    """Reads scalar data from a CSV log file into a pandas DataFrame."""
     try:
-        from tensorboard.backend.event_processing import event_accumulator
-        ea = event_accumulator.EventAccumulator(log_dir, size_guidance={event_accumulator.SCALARS: 0})
-        ea.Reload()
-        required_tags = {'train_accuracy', 'validation_accuracy'}
-        if not required_tags.issubset(ea.Tags()['scalars']): return None
-        
-        df_train = pd.DataFrame([(e.step, e.value) for e in ea.Scalars('train_accuracy')], columns=['epoch', 'train_accuracy'])
-        df_val = pd.DataFrame([(e.step, e.value) for e in ea.Scalars('validation_accuracy')], columns=['epoch', 'validation_accuracy'])
-        
-        history_df = pd.merge(df_train, df_val, on='epoch', how='outer').sort_values('epoch').ffill().dropna()
-        return history_df
-    except Exception:
+        history_df = pd.read_csv(log_path)
+        required_cols = {'epoch', 'train_accuracy', 'validation_accuracy'}
+        if not required_cols.issubset(history_df.columns):
+            print(f"Warning: CSV log at {log_path} is missing required columns.")
+            return None
+        return history_df[['epoch', 'train_accuracy', 'validation_accuracy']].sort_values('epoch').ffill().dropna()
+    except Exception as e:
+        print(f"Error reading CSV log at {log_path}: {e}")
         return None
 
 def main():
@@ -34,7 +30,7 @@ def main():
     )
     parser.add_argument("meta_analysis_file", type=str, help="Path to the grokking_meta_analysis.csv file.")
     parser.add_argument("analysis_summary_file", type=str, help="Path to the grokking_analysis_summary.csv file (to find run names).")
-    parser.add_argument("logs_dir", type=str, help="Path to the parent directory containing all TensorBoard log folders.")
+    parser.add_argument("logs_dir", type=str, help="Path to the parent directory containing all log folders.")
     parser.add_argument("--output_file", type=str, default="learning_curves_figure.pdf", help="Name for the output PDF figure.")
     parser.add_argument("--num_examples", type=int, default=4, help="Number of representative examples to plot.")
     parser.add_argument("--min_epochs", type=int, default=50000, help="Minimum number of epochs to show on the x-axis.")
@@ -100,9 +96,9 @@ def main():
         pdb_id = run_info['pdb_id']
         mem_epoch = run_info['memorization_epoch']
         grok_epoch = run_info['grokking_epoch']
-        log_path = os.path.join(args.logs_dir, run_name)
+        log_path = os.path.join(args.logs_dir, f"{run_name}.csv")
         
-        history = read_tensorboard_log(log_path)
+        history = read_csv_log(log_path)
         if history is None:
             ax.text(0.5, 0.5, f"Could not load log for\n{run_name}", ha='center', va='center')
             continue
@@ -113,7 +109,7 @@ def main():
         sns.lineplot(x='epoch', y='train_accuracy', data=history, ax=ax, label='Train Accuracy', color='C0')
         sns.lineplot(x='epoch', y='validation_accuracy', data=history, ax=ax, label='Validation Accuracy', color='C1')
         
-        # --- NEW: Visualize Memorization and Grokking Points ---
+        # --- Visualize Memorization and Grokking Points ---
         if mem_epoch != -1:
             ax.axvline(x=mem_epoch, color='purple', linestyle=':', linewidth=2, alpha=0.8)
 
@@ -149,5 +145,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-

@@ -71,6 +71,11 @@ class TensorBoardLogger(BaseLogger):
 class CSVLogger(BaseLogger):
     def __init__(self, config, run_name, log_dir="logs"):
         super().__init__(config, run_name)
+        try:
+            os.mkdir(log_dir)
+        except:
+            pass
+
         log_path = os.path.join(log_dir, f"{run_name}.csv")
         self.log_file = open(log_path, 'w', newline='')
         self.writer = None
