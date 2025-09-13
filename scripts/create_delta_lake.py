@@ -19,6 +19,7 @@ def main():
         "Target Name",
         "Ligand SMILES",
         "BindingDB Ligand Name",
+        "UniProt (SwissProt) Primary ID of Target Chain 1",
     )
     assay_cols = (
         "Ki (nM)",
