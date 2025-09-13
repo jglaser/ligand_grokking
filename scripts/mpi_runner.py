@@ -62,8 +62,8 @@ def main():
     parser.add_argument("--epochs", type=int, default=200000)
     parser.add_argument("--n_inducing_points", type=int, default=100)
     parser.add_argument("--wandb_project", type=str, default="grok_pdbbind")
-    parser.add_argument("--logger", type=str, default="tensorboard", choices=["tensorboard", "wandb"])
-    parser.add_argument("--log_interval", type=int, default=1000, choices=["tensorboard", "wandb"])
+    parser.add_argument("--logger", type=str, default="csv", choices=["tensorboard", "wandb", "csv"])
+    parser.add_argument("--log_interval", type=int, default=1000)
     parser.add_argument("--log_dir", type=str, default="logs", help="Base directory for local TensorBoard logs.")
 
     args = parser.parse_args()
