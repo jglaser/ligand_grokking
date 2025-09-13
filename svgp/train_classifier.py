@@ -5,6 +5,7 @@ import jax
 import jax.numpy as jnp
 from tqdm.auto import tqdm
 import os
+import csv
 
 # --- Logger Abstraction ---
 # This allows us to easily switch between different logging backends.
@@ -67,6 +68,28 @@ class TensorBoardLogger(BaseLogger):
             self.writer.close()
             print(f"TensorBoard log for '{self.run_name}' closed.")
 
+class CSVLogger(BaseLogger):
+    def __init__(self, config, run_name, log_dir="logs"):
+        super().__init__(config, run_name)
+        log_path = os.path.join(log_dir, f"{run_name}.csv")
+        self.log_file = open(log_path, 'w', newline='')
+        self.writer = None
+        self.header_written = False
+
+    def log(self, metrics, step):
+        if not self.header_written:
+            self.writer = csv.DictWriter(self.log_file, fieldnames=['epoch'] + list(metrics.keys()))
+            self.writer.writeheader()
+            self.header_written = True
+        
+        log_data = {'epoch': step, **metrics}
+        self.writer.writerow(log_data)
+
+    def finish(self):
+        if self.log_file:
+            self.log_file.close()
+            print(f"CSV log for '{self.run_name}' closed.")
+
 # --- The rest of the script remains largely the same ---
 # (Featurizer, Encoder, Alpha estimation, etc.)
 
@@ -119,21 +142,21 @@ def featurize_smiles(smiles_list, model_name, batch_size=64, max_length=512):
     return np.vstack(all_features)
 
 # --- Logging Callback ---
-def log_callback_factory(X_train, y_train, X_val, y_val, logger):
+def log_callback_factory(X_train, y_train, X_val, y_val, logger, log_interval=100):
     def log_callback(model, epoch, metrics, params, bias_state):
-        if epoch % 100 == 0:
+        if epoch % log_interval == 0:
             val_score = model.score(X_val, y_val, params=params)
             metrics["validation_accuracy"] = val_score
             train_subset_idx = np.random.choice(X_train.shape[0], size=min(len(y_val), len(y_train)), replace=False)
             X_train_subset, y_train_subset = X_train[train_subset_idx], y_train[train_subset_idx]
             train_score = model.score(X_train_subset, y_train_subset, params=params)
             metrics["train_accuracy"] = train_score
-        if epoch % 100 == 0 and 'encoder_params' in params and 'W' in params['encoder_params']:
+        if epoch % log_interval == 0 and 'encoder_params' in params and 'W' in params['encoder_params']:
             svals = jnp.linalg.svd(params['encoder_params']['W'], compute_uv=False)
             metrics['htsr_alpha'] = estimate_alpha_fit(svals**2)
         
         # Use the logger object to log the metrics
-        if epoch % 100 == 0:
+        if epoch % log_interval == 0:
             logger.log(metrics, step=epoch)
         return metrics # Return for progress bar
     return log_callback
@@ -155,8 +178,9 @@ def main():
     parser.add_argument("--random_seed", type=int, default=42)
     
     # --- New/Modified Logging Arguments ---
-    parser.add_argument("--logger", type=str, default="tensorboard", choices=["tensorboard", "wandb"], help="Logging backend to use.")
-    parser.add_argument("--log_dir", type=str, default="logs", help="Directory for TensorBoard logs.")
+    parser.add_argument("--logger", type=str, default="csv", choices=["tensorboard", "wandb", "csv"], help="Logging backend to use.")
+    parser.add_argument("--log_interval", type=int, default=100, help="Number of epochs between logging steps.")
+    parser.add_argument("--log_dir", type=str, default="logs", help="Directory for TensorBoard or CSV logs.")
     parser.add_argument("--wandb_project", type=str, default="grokking_chemistry", help="Weights & Biases project name.")
     parser.add_argument("--wandb_run_name", type=str, default="experiment", help="A name for this specific W&B run.")
 
@@ -166,8 +190,10 @@ def main():
     # --- Setup Logger ---
     if args.logger == "wandb":
         logger = WandbLogger(config=vars(args), run_name=args.wandb_run_name, project_name=args.wandb_project)
-    else: # tensorboard
+    elif args.logger == "tensorboard":
         logger = TensorBoardLogger(config=vars(args), run_name=args.wandb_run_name, log_dir=args.log_dir)
+    else: # csv
+        logger = CSVLogger(config=vars(args), run_name=args.wandb_run_name, log_dir=args.log_dir)
 
     # --- THE FIX: Use a try...finally block to guarantee logger cleanup ---
     try:
@@ -185,7 +211,7 @@ def main():
         y_test = x_test_df['active'].to_numpy()
 
         # --- Setup and Train Model ---
-        callback = log_callback_factory(X_train, y_train, X_test, y_test, logger)
+        callback = log_callback_factory(X_train, y_train, X_test, y_test, logger, args.log_interval)
         key, encoder_key, hparam_key = jax.random.split(key, 3)
         encoder = LinearEncoder(encoder_key, X_train.shape[-1], args.encoder_dim)
         
@@ -212,5 +238,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
-

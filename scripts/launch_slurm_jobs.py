@@ -7,7 +7,7 @@ import itertools
 import math
 
 def generate_slurm_script(job_name: str, account: str, time: str, nodes_per_job: int, partition: str,
-                        num_chunks: int, datasets_dir: str, campaign_hash: str):
+                        num_chunks: int, datasets_dir: str, log_dir: str, campaign_hash: str):
     """
     Generates the content of a single SLURM script that launches an array of MPI jobs.
     """
@@ -21,11 +21,11 @@ def generate_slurm_script(job_name: str, account: str, time: str, nodes_per_job:
 #SBATCH --cpus-per-task=1
 #SBATCH --time={time}
 #SBATCH --array=1-{num_chunks}
-#SBATCH -o slurm/%x-%A_%a.out
-#SBATCH -e slurm/%x-%A_%a.err
+#SBATCH -o slurm/%A_%a.out
+#SBATCH -e slurm/%A_%a.err
 
 # --- Environment Setup (MODIFY THIS SECTION) ---
-# ... (your environment setup here, e.g., conda activate)
+# ...
 
 echo "Job Array Task $SLURM_ARRAY_TASK_ID starting on $(hostname)"
 echo "SLURM Job ID: $SLURM_JOB_ID"
@@ -38,7 +38,8 @@ echo "This MPI job will process tasks from: $TASK_FILE"
 # --- Launch the MPI job for this chunk ---
 srun python mpi_runner.py \\
     --datasets_dir {abs_datasets_dir} \\
-    --task_list "$TASK_FILE"
+    --task_list "$TASK_FILE" \\
+    --log_dir {log_dir}
 
 echo "Job Array Task $SLURM_ARRAY_TASK_ID finished with exit code $?"
 """
@@ -54,6 +55,7 @@ def main():
     parser.add_argument("--nodes_per_job", type=int, default=10, help="Number of nodes to allocate for EACH MPI job in the array.")
     parser.add_argument("--partition", type=str, default="batch", help="SLURM partition/queue.")
     parser.add_argument("--tasks_per_job", type=int, default=5000, help="Maximum number of training runs to process in a single MPI job.")
+    parser.add_argument("--log_dir", type=str, default='logs', help="Directory to log training output to.")
 
     # --- Hyperparameter Grid Definition ---
     # These are defined here to create the master task list
@@ -93,7 +95,7 @@ def main():
     # --- 5. Generate a Single SLURM Submission Script for the Array ---
     slurm_script_content = generate_slurm_script(
         args.job_name, args.account, args.time, args.nodes_per_job, args.partition,
-        num_chunks, args.datasets_dir, campaign_hash
+        num_chunks, args.datasets_dir, args.log_dir, campaign_hash
     )
     
     slurm_file = "submit_array.slurm"

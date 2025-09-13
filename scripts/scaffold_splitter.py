@@ -10,241 +10,147 @@ from rdkit import Chem
 from rdkit.Chem.Scaffolds import MurckoScaffold
 from tqdm.auto import tqdm
 
-# --- Helper Functions ---
-
-def canonicalize_smiles_worker(smiles: str) -> tuple[str, str | None]:
-    """
-    Canonicalizes a single SMILES string for parallel processing.
-    Returns a tuple of (original_smiles, canonical_smiles).
-    """
-    if not smiles:
-        return smiles, None
+# --- Worker functions for parallel processing (must be at top level) ---
+def canonicalize_smiles(smiles: str) -> str:
+    """Canonicalizes a single SMILES string."""
     try:
         mol = Chem.MolFromSmiles(smiles)
-        if mol is None:
-            return smiles, None
-        return smiles, Chem.MolToSmiles(mol, canonical=True)
-    except Exception:
-        return smiles, None
+        return Chem.MolToSmiles(mol, canonical=True) if mol else None
+    except:
+        return None
 
-def get_scaffold(smiles_string: str) -> str | None:
+def get_scaffold(smiles_string: str) -> str:
     """Computes the Murcko scaffold for a given SMILES string."""
     try:
         mol = Chem.MolFromSmiles(smiles_string)
-        if mol is None: return None
-        scaffold = MurckoScaffold.GetScaffoldForMol(mol)
-        return Chem.MolToSmiles(scaffold, canonical=True) if scaffold else None
-    except Exception:
-        return None
+        if mol:
+            scaffold = MurckoScaffold.GetScaffoldForMol(mol)
+            return Chem.MolToSmiles(scaffold, canonical=True)
+        return ""
+    except:
+        return ""
 
-def create_scaffold_split(df: pd.DataFrame, test_size: float = 0.2, max_scaffolds: int | None = None):
-    """
-    Splits a DataFrame into training and test sets based on molecular scaffolds,
-    with an option to limit the number of scaffolds.
-    """
+def create_scaffold_split(df: pd.DataFrame, test_size: float = 0.2):
+    """Splits a DataFrame into training and test sets based on molecular scaffolds."""
     scaffolds = defaultdict(list)
     for idx, row in df.iterrows():
         scaffold = get_scaffold(row['smiles'])
         if scaffold:
             scaffolds[scaffold].append(idx)
 
-    # Sort scaffolds by the number of molecules they contain (descending)
-    scaffold_counts = sorted(scaffolds.items(), key=lambda x: len(x[1]), reverse=True)
-
-    # --- NEW: Limit the number of scaffolds if max_scaffolds is set ---
-    if max_scaffolds and len(scaffold_counts) > max_scaffolds:
-        scaffold_counts = scaffold_counts[:max_scaffolds]
-        # Filter the original DataFrame to only include molecules from the selected scaffolds
-        selected_indices = [idx for _, indices in scaffold_counts for idx in indices]
-        df = df.loc[selected_indices].reset_index(drop=True)
-        # Re-build the scaffold dictionary with the filtered data
-        scaffolds = defaultdict(list)
-        for idx, row in df.iterrows():
-            scaffold = get_scaffold(row['smiles'])
-            if scaffold:
-                scaffolds[scaffold].append(idx)
-        # Re-sort the (now smaller) scaffold list for splitting
-        scaffold_counts = sorted(scaffolds.items(), key=lambda x: len(x[1]))
-    # --- END NEW SECTION ---
-
+    scaffold_counts = sorted(scaffolds.items(), key=lambda x: len(x[1]))
     train_indices, test_indices = [], []
     n_test_target = int(len(df) * test_size)
 
-    # The original splitting logic remains the same
-    # We iterate through smaller scaffolds first to put them in the test set
-    for scaffold, indices in scaffold_counts:
+    for _, indices in scaffold_counts:
         if len(test_indices) < n_test_target:
             test_indices.extend(indices)
         else:
             train_indices.extend(indices)
-
-    # Handle the case where the split might result in empty sets
-    if not train_indices or not test_indices:
-        return pd.DataFrame(), pd.DataFrame()
-
     return df.loc[train_indices].reset_index(drop=True), df.loc[test_indices].reset_index(drop=True)
-
 
 def process_and_save_target(args_tuple):
     """
-    Worker function to threshold, split, and save a pre-processed DataFrame group.
+    Worker function to process a single target: filter, threshold, split, and save.
+    Returns metadata upon completion.
     """
-    pdb_id, target_df, args = args_tuple
-    if target_df.empty:
-        return None
+    uniprot_id, target_df_pd, args, uniprot_to_pdb = args_tuple
+    if target_df_pd.empty: return None
 
-    threshold = target_df['activity'].quantile(args.activity_percentile / 100.0)
+    threshold = target_df_pd['activity'].quantile(args.activity_percentile / 100.0)
+    target_df_pd['active'] = (target_df_pd['activity'] < threshold).astype(int)
+    final_df = target_df_pd[['ligand_name', 'smiles', 'active']]
 
-    df_final = target_df.copy()
-    df_final['active'] = (df_final['activity'] < threshold).astype(int)
-    df_final = df_final[['ligand_name', 'smiles', 'active']]
+    if args.max_ligands and len(final_df) > args.max_ligands:
+        final_df = final_df.sample(n=args.max_ligands, random_state=42)
 
-    if args.max_ligands and len(df_final) > args.max_ligands:
-        df_final = df_final.sample(n=args.max_ligands, random_state=42)
+    train_df, test_df = create_scaffold_split(final_df, test_size=args.test_size)
+    if train_df.empty or test_df.empty: return None
 
-    # --- MODIFIED: Pass the max_scaffolds argument to the split function ---
-    train_df, test_df = create_scaffold_split(df_final, test_size=args.test_size, max_scaffolds=args.max_scaffolds)
-
-    if train_df.empty or test_df.empty:
-        return None
-
+    pdb_id = uniprot_to_pdb.get(uniprot_id, uniprot_id)
     target_output_path = os.path.join(args.output_dir, pdb_id)
     os.makedirs(target_output_path, exist_ok=True)
 
-    train_file = os.path.join(target_output_path, "train.csv")
-    test_file = os.path.join(target_output_path, "test.csv")
-    train_df.to_csv(train_file, index=False, quoting=1)
-    test_df.to_csv(test_file, index=False, quoting=1)
+    train_df.to_csv(os.path.join(target_output_path, "train.csv"), index=False, quoting=1)
+    test_df.to_csv(os.path.join(target_output_path, "test.csv"), index=False, quoting=1)
 
     return {
-        'pdb_id': pdb_id,
-        'target_name': target_df['Target Name'].iloc[0],
-        'activity_threshold_nM': threshold,
-        'num_total_molecules': len(df_final),
-        'num_train': len(train_df),
-        'num_test': len(test_df),
-        'num_scaffolds': len(pd.concat([train_df, test_df])['smiles'].apply(get_scaffold).unique())
+        'pdb_id': pdb_id, 'uniprot_id': uniprot_id,
+        'activity_threshold_nM': threshold, 'num_total_molecules': len(final_df),
+        'num_train': len(train_df), 'num_test': len(test_df)
     }
 
-# --- Main Logic ---
-
 def main():
-    parser = argparse.ArgumentParser(description="Filter BindingDB Delta Lake for PDB IDs and create scaffold-based train/test splits.")
-    parser.add_argument("input_file", type=str, help="Path to the BindingDB Delta Lake directory.")
-    parser.add_argument("--pdb_ids", type=str, nargs='+', required=True, help="A list of PDB IDs to filter for.")
-    parser.add_argument("--output_dir", type=str, required=True, help="Directory to save the generated dataset subdirectories.")
+    parser = argparse.ArgumentParser(
+        description="Filter BindingDB by UniProt ID and create scaffold-based train/test splits.",
+        formatter_class=argparse.RawTextHelpFormatter
+    )
+    parser.add_argument("binding_db_file", type=str, help="Path to the complete BindingDB Delta Lake directory.")
+    parser.add_argument("metadata_file", type=str, help="Path to the target_pocket_metadata.csv file.")
+    parser.add_argument("--output_dir", type=str, default="datasets", help="Directory to save the generated dataset subdirectories.")
     parser.add_argument("--summary_file", type=str, default="dataset_split_summary.csv", help="Name for the output summary CSV file.")
     parser.add_argument("--activity_cols", type=str, default="Ki (nM),IC50 (nM),Kd (nM)", help='Comma-separated list of activity columns.')
     parser.add_argument("--activity_percentile", type=float, default=50.0, help="Activity percentile to define active compounds.")
     parser.add_argument("--test_size", type=float, default=0.2, help="Approximate fraction for the test set.")
     parser.add_argument("--max_ligands", type=int, default=1000, help="Maximum number of ligands per target.")
-    # --- NEW: Command-line argument for max scaffolds ---
     parser.add_argument("--max_scaffolds", type=int, default=None, help="Maximum number of Murcko scaffolds to include per target.")
     args = parser.parse_args()
 
-    # (The rest of the main function remains the same)
-    # --- Pass 1: Efficiently map PDB IDs to Target Names ---
-    print(f"Pass 1: Mapping {len(args.pdb_ids)} PDB IDs to Target Names...")
-    pdb_regex = f"(?i)({'|'.join(args.pdb_ids)})"
+    if not os.path.exists(args.output_dir):
+        os.makedirs(args.output_dir)
 
     try:
-        q_map = (
-            pl.scan_delta(args.input_file)
-            .filter(pl.col("PDB ID(s) for Ligand-Target Complex").str.contains(pdb_regex))
-            .select(["PDB ID(s) for Ligand-Target Complex", "Target Name"])
-            .unique()
-            .collect()
-        )
+        metadata_df = pd.read_csv(args.metadata_file)
+        uniprot_ids_to_process = metadata_df['uniprot_id'].unique().tolist()
+        uniprot_to_pdb = dict(zip(metadata_df['uniprot_id'], metadata_df['pdb_id']))
     except Exception as e:
-        print(f"Error during Delta Lake scan for PDB mapping: {e}")
-        return
+        print(f"Error reading metadata file: {e}"); return
+    
+    print(f"Found {len(uniprot_ids_to_process)} unique UniProt IDs to process from {args.metadata_file}.")
 
-    pdb_to_name_map = {}
-    name_to_pdb_map = defaultdict(list)
-    for row in q_map.iter_rows(named=True):
-        pdb_id_str = row["PDB ID(s) for Ligand-Target Complex"]
-        target_name = row["Target Name"]
-        for pdb_id in args.pdb_ids:
-            if pdb_id.lower() in pdb_id_str.lower():
-                pdb_to_name_map[pdb_id] = target_name
-                if pdb_id not in name_to_pdb_map[target_name]:
-                     name_to_pdb_map[target_name].append(pdb_id)
-
-    target_names_to_fetch = set(pdb_to_name_map.values())
-    print(f"Mapped {len(pdb_to_name_map)} PDB IDs to {len(target_names_to_fetch)} unique target names.")
-
-    # --- Pass 2: Lazily Fetch Data and then Pre-process SMILES in Parallel ---
-    print(f"Pass 2: Lazily fetching data for {len(target_names_to_fetch)} targets...")
+    # Lazily scan the Delta Lake and filter for our UniProt IDs
     activity_cols_list = [col.strip() for col in args.activity_cols.split(',')]
-
-    try:
-        map_df = pl.DataFrame([
-            {"Target Name": name, "pdb_id": pdb}
-            for name, pdbs in name_to_pdb_map.items()
-            for pdb in pdbs
-        ])
-
-        q_raw = (
-            pl.scan_delta(args.input_file)
-            .filter(pl.col("Target Name").is_in(list(target_names_to_fetch)))
-            .join(map_df.lazy(), on="Target Name", how="inner")
-            .rename({'BindingDB Ligand Name': 'ligand_name', 'Ligand SMILES': 'smiles'})
-            .with_columns(
-                pl.min_horizontal([
-                    pl.col(col).cast(pl.Utf8).str.replace_all(r"[<>]", "").cast(pl.Float64, strict=False)
-                    for col in activity_cols_list
-                ]).alias("activity")
-            )
-            .filter(pl.col("smiles").is_not_null() & pl.col("activity").is_not_null())
-            .select(["pdb_id", "Target Name", "ligand_name", "smiles", "activity"])
+    lf = (
+        pl.scan_delta(args.binding_db_file)
+        .filter(pl.col("UniProt (SwissProt) Primary ID of Target Chain 1").is_in(uniprot_ids_to_process))
+        .rename({'BindingDB Ligand Name': 'ligand_name', 
+                 'Ligand SMILES': 'smiles',
+                 'UniProt (SwissProt) Primary ID of Target Chain 1': 'uniprot_id'})
+        .with_columns(
+            pl.min_horizontal([
+                pl.col(col).cast(pl.Utf8).str.replace_all(r"[<>]", "").cast(pl.Float64, strict=False)
+                for col in activity_cols_list
+            ]).alias("activity")
         )
+        .filter(pl.col("smiles").is_not_null() & pl.col("activity").is_not_null())
+        .select(["uniprot_id", "ligand_name", "smiles", "activity"])
+    )
 
-        unique_smiles = q_raw.select("smiles").unique().collect().get_column("smiles").to_list()
-        print(f"Found {len(unique_smiles)} unique SMILES to canonicalize...")
-
-        with Pool(cpu_count()) as p:
-            results = list(tqdm(
-                p.imap(canonicalize_smiles_worker, unique_smiles, chunksize=1000),
-                total=len(unique_smiles),
-                desc="Canonicalizing SMILES in parallel"
-            ))
-
-        smiles_map_df = pl.DataFrame(
-            results,
-            schema=[("smiles", pl.Utf8), ("canonical_smiles", pl.Utf8)]
-        ).drop_nulls("canonical_smiles")
-
-        print("Deduplicating and finalizing dataset...")
-        q_processed = (
-            q_raw
-            .join(smiles_map_df.lazy(), on="smiles", how="inner")
-            .group_by(['pdb_id', 'Target Name', 'canonical_smiles'])
-            .agg(
-                pl.col('activity').median().alias('activity'),
-                pl.col('ligand_name').first().alias('ligand_name')
-            )
-            .rename({"canonical_smiles": "smiles"})
-        )
-
-        processed_df = q_processed.collect().to_pandas()
-        print(f"Processed down to {len(processed_df)} unique molecule-target-PDB triplets.")
-
-    except Exception as e:
-        print(f"Polars processing failed: {e}")
-        return
-
-    tasks = [
-        (pdb_id, group, args)
-        for pdb_id, group in processed_df.groupby('pdb_id')
-    ]
-
-    print(f"\nGenerating individual datasets for {len(tasks)} PDB IDs in parallel...")
+    # Collect the full filtered dataset into memory
+    print("Collecting and processing data from BindingDB...")
+    df_collected = lf.collect().to_pandas()
+    
+    # Canonicalize SMILES in parallel
+    unique_smiles = df_collected['smiles'].unique()
     with Pool(cpu_count()) as p:
-        results = list(tqdm(
-            p.imap(process_and_save_target, tasks),
-            total=len(tasks),
-            desc="Generating Datasets"
-        ))
+        smiles_map = dict(zip(unique_smiles, tqdm(p.imap(canonicalize_smiles, unique_smiles), total=len(unique_smiles), desc="Canonicalizing SMILES")))
+    
+    df_collected['smiles'] = df_collected['smiles'].map(smiles_map)
+    df_collected.dropna(subset=['smiles'], inplace=True)
+
+    # Deduplicate based on UniProt ID and canonical SMILES
+    deduplicated_pd = df_collected.groupby(['uniprot_id', 'smiles']).agg(
+        activity=('activity', 'median'),
+        ligand_name=('ligand_name', 'first')
+    ).reset_index()
+
+    # Prepare tasks for parallel processing
+    tasks = [(uniprot_id, group, args, uniprot_to_pdb) for uniprot_id, group in deduplicated_pd.groupby('uniprot_id')]
+
+    split_metadata = []
+    print(f"\nGenerating individual datasets for {len(tasks)} targets in parallel...")
+    with Pool(cpu_count()) as p:
+        results = list(tqdm(p.imap(process_and_save_target, tasks), total=len(tasks), desc="Generating datasets"))
 
     split_metadata = [meta for meta in results if meta]
 
@@ -255,7 +161,6 @@ def main():
         print(f"\nSaved split metadata summary for {len(summary_df)} targets to: {summary_file_path}")
     else:
         print("\nNo datasets were successfully generated.")
-
 
 if __name__ == '__main__':
     main()
