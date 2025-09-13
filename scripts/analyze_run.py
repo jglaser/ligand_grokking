@@ -1,5 +1,5 @@
-import argparse
 import os
+import argparse
 import numpy as np
 import pandas as pd
 from tqdm.auto import tqdm
@@ -113,17 +113,29 @@ def read_csv_log(log_file: str) -> pd.DataFrame:
     except Exception:
         return None
 
-def analyze_log_worker(log_path: str):
+def analyze_log_worker(log_path: str, epoch_window_size: int):
     run_name = os.path.basename(log_path).replace('.csv', '')
     try:
         if log_path.endswith('.csv'):
             history = read_csv_log(log_path)
         else:
             history = read_tensorboard_log(log_path)
-        
+
         if history is None: return {'run_name': run_name, 'status': 'failed_read'}
         if history.empty or len(history) < 100: return {'run_name': run_name, 'status': 'too_short'}
-        mem_epoch, grok_epoch = find_grokking_point_vectorized(history["epoch"].values, history["train_accuracy"].values, history["validation_accuracy"].values)
+
+        # --- FIX: Calculate window size in rows ---
+        epochs_per_row = (history["epoch"].iloc[-1] - history["epoch"].iloc[0]) / len(history)
+        if epochs_per_row <= 0: return {'run_name': run_name, 'status': 'failed_read'} # Avoid division by zero
+        window_size = max(1, int(epoch_window_size / epochs_per_row)) # at least 1
+
+        mem_epoch, grok_epoch = find_grokking_point_vectorized(
+            history["epoch"].values,
+            history["train_accuracy"].values,
+            history["validation_accuracy"].values,
+            window_size=window_size # Pass the calculated window size
+        )
+
         delay = grok_epoch - mem_epoch if grok_epoch != -1 and mem_epoch != -1 else -1
         return {'run_name': run_name, 'memorization_epoch': mem_epoch, 'grokking_epoch': grok_epoch,
                 'grokking_delay': delay, 'grokking_detected': grok_epoch != -1, 'status': 'success'}
@@ -135,6 +147,8 @@ def main():
     parser.add_argument("log_dir", type=str, help="Path to the local log directory ('logs/').")
     parser.add_argument("dataset_summary_file", type=str, help="Path to the dataset_split_summary.csv file.")
     parser.add_argument("--output_file", type=str, default="grokking_analysis_summary.csv", help="Name for the output summary CSV file.")
+    parser.add_argument("--epoch_window_size", type=int, default=5000, help="Window size in epochs for smoothing and analysis.")
+
     args = parser.parse_args()
     
     log_files = []
@@ -146,8 +160,13 @@ def main():
     print(f"Found {len(log_files)} potential runs in '{args.log_dir}'. Analyzing in parallel...")
     stats = {'total_runs': len(log_files), 'failed_reads': 0, 'too_short': 0, 'analyzed_runs': 0, 'grokking_runs': 0}
     successful_results = []
+
     with Pool(cpu_count()) as p:
-        results = list(tqdm(p.imap(analyze_log_worker, log_files), total=len(log_files), desc="Analyzing Logs"))
+        # Use a partial function or a wrapper to pass the new argument
+        from functools import partial
+        worker = partial(analyze_log_worker, epoch_window_size=args.epoch_window_size)
+        results = list(tqdm(p.imap(worker, log_files), total=len(log_files), desc="Analyzing Logs"))
+
     for result in results:
         if result is None: stats['failed_reads'] += 1; continue
         status = result.get('status', 'failed_read')
