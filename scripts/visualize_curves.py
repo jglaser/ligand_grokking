@@ -45,8 +45,8 @@ def main():
         print(f"Error: Could not find an input file. {e}")
         return
 
-    if 'run_name' in summary_df.columns and 'pdb_id' not in summary_df.columns:
-        summary_df['pdb_id'] = summary_df['run_name'].apply(lambda x: x.split('-seed-')[0])
+    if 'run_name' in summary_df.columns and 'uniprot_id' not in summary_df.columns:
+        summary_df['uniprot_id'] = summary_df['run_name'].apply(lambda x: x.split('-seed-')[0])
 
     # --- 2. Select Representative Runs ---
     representatives = {}
@@ -61,16 +61,16 @@ def main():
         representatives['Shortest Delay'] = grokking_runs_df.loc[grokking_runs_df['grokking_delay'].idxmin()]
 
     if not meta_df['grokking_frequency'].dropna().empty:
-        highest_freq_pdb = meta_df.loc[meta_df['grokking_frequency'].idxmax()]['pdb_id']
-        possible_runs = grokking_runs_df[grokking_runs_df['pdb_id'] == highest_freq_pdb]
+        highest_freq_pdb = meta_df.loc[meta_df['grokking_frequency'].idxmax()]['uniprot_id']
+        possible_runs = grokking_runs_df[grokking_runs_df['uniprot_id'] == highest_freq_pdb]
         if not possible_runs.empty:
-            if highest_freq_pdb not in [v['pdb_id'] for v in representatives.values()]:
+            if highest_freq_pdb not in [v['uniprot_id'] for v in representatives.values()]:
                  representatives['Highest Frequency'] = possible_runs.iloc[0]
 
     sorted_by_delay = grokking_runs_df.sort_values('grokking_delay', ascending=False)
     for _, row in sorted_by_delay.iterrows():
         if len(representatives) >= args.num_examples: break
-        if row['pdb_id'] not in [v['pdb_id'] for v in representatives.values()]:
+        if row['uniprot_id'] not in [v['uniprot_id'] for v in representatives.values()]:
             representatives[f"Mid Delay ({int(row['grokking_delay'])})"] = row
             
     print("Selected representative runs for plotting:")
@@ -93,7 +93,7 @@ def main():
 
     for ax, (title, run_info) in zip(axes, representatives.items()):
         run_name = run_info['run_name']
-        pdb_id = run_info['pdb_id']
+        uniprot_id = run_info['uniprot_id']
         mem_epoch = run_info['memorization_epoch']
         grok_epoch = run_info['grokking_epoch']
         log_path = os.path.join(args.logs_dir, f"{run_name}.csv")
@@ -116,7 +116,7 @@ def main():
         if grok_epoch != -1:
             ax.axvline(x=grok_epoch, color='green', linestyle='--', linewidth=2, alpha=0.8)
 
-        ax.set_title(f"{title}: {pdb_id}", fontsize=12)
+        ax.set_title(f"{title}: {uniprot_id}", fontsize=12)
         ax.set_ylabel("Accuracy")
 
         # Create a cleaner legend
