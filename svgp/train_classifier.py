@@ -5,11 +5,9 @@ import jax
 import jax.numpy as jnp
 from tqdm.auto import tqdm
 import os
-import csv
+import pandas as pd
 
 # --- Logger Abstraction ---
-# This allows us to easily switch between different logging backends.
-
 class BaseLogger:
     def __init__(self, config, run_name):
         self.config = config
@@ -19,84 +17,31 @@ class BaseLogger:
     def finish(self):
         pass
 
-class WandbLogger(BaseLogger):
-    def __init__(self, config, run_name, project_name):
-        super().__init__(config, run_name)
-        try:
-            import wandb
-            self.wandb = wandb
-            self.run = self.wandb.init(
-                project=project_name,
-                name=run_name,
-                config=config,
-                reinit=True
-            )
-        except ImportError:
-            print("Wandb not installed. Please install with 'pip install wandb'.")
-            self.wandb = None
-    
-    def log(self, metrics, step):
-        if self.wandb and self.run:
-            self.run.log(metrics, step=step)
-
-    def finish(self):
-        if self.wandb and self.run:
-            self.run.finish()
-
-class TensorBoardLogger(BaseLogger):
-    def __init__(self, config, run_name, log_dir="logs"):
-        super().__init__(config, run_name)
-        try:
-            from torch.utils.tensorboard import SummaryWriter
-            log_path = os.path.join(log_dir, run_name)
-            self.writer = SummaryWriter(log_path)
-            # Log hyperparameters as text for easy viewing
-            hparams_text = "\n".join([f"{key}: {value}" for key, value in config.items()])
-            self.writer.add_text("Hyperparameters", hparams_text)
-        except ImportError:
-            print("TensorBoard not installed. Please install with 'pip install tensorboard'.")
-            self.writer = None
-
-    def log(self, metrics, step):
-        if self.writer:
-            for key, value in metrics.items():
-                if np.isfinite(value): # Only log finite values
-                    self.writer.add_scalar(key, np.array(value), step)
-    
-    def finish(self):
-        if self.writer:
-            self.writer.close()
-            print(f"TensorBoard log for '{self.run_name}' closed.")
-
 class CSVLogger(BaseLogger):
+    """A logger that saves metrics to a CSV file."""
     def __init__(self, config, run_name, log_dir="logs"):
         super().__init__(config, run_name)
-        try:
-            os.mkdir(log_dir)
-        except:
-            pass
-
-        log_path = os.path.join(log_dir, f"{run_name}.csv")
-        self.log_file = open(log_path, 'w', newline='')
-        self.writer = None
-        self.header_written = False
+        self.log_dir = log_dir
+        self.log_file = os.path.join(self.log_dir, f"{self.run_name}.csv")
+        self.log_data = []
+        # Ensure log directory exists
+        os.makedirs(self.log_dir, exist_ok=True)
 
     def log(self, metrics, step):
-        if not self.header_written:
-            self.writer = csv.DictWriter(self.log_file, fieldnames=['epoch'] + list(metrics.keys()))
-            self.writer.writeheader()
-            self.header_written = True
-        
-        log_data = {'epoch': step, **metrics}
-        self.writer.writerow(log_data)
+        """Stores metrics in memory to be written to file upon completion."""
+        log_entry = {'epoch': step}
+        log_entry.update(metrics)
+        self.log_data.append(log_entry)
 
     def finish(self):
-        if self.log_file:
-            self.log_file.close()
-            print(f"CSV log for '{self.run_name}' closed.")
-
-# --- The rest of the script remains largely the same ---
-# (Featurizer, Encoder, Alpha estimation, etc.)
+        """Converts logged data to a DataFrame and saves as a CSV."""
+        if self.log_data:
+            df = pd.DataFrame(self.log_data)
+            # Ensure consistent column order
+            cols = ['epoch', 'train_accuracy', 'validation_accuracy', 'htsr_alpha']
+            df = df.reindex(columns=[c for c in cols if c in df.columns])
+            df.to_csv(self.log_file, index=False)
+            print(f"CSV log for '{self.run_name}' saved to: {self.log_file}")
 
 # Local import of your classifier
 from svgp_classifier import SparseVariationalGPClassifier
@@ -147,28 +92,26 @@ def featurize_smiles(smiles_list, model_name, batch_size=64, max_length=512):
     return np.vstack(all_features)
 
 # --- Logging Callback ---
-def log_callback_factory(X_train, y_train, X_val, y_val, logger, log_interval=100):
+def log_callback_factory(X_train, y_train, X_val, y_val, logger):
     def log_callback(model, epoch, metrics, params, bias_state):
-        if epoch % log_interval == 0:
+        if epoch % 100 == 0:
             val_score = model.score(X_val, y_val, params=params)
             metrics["validation_accuracy"] = val_score
             train_subset_idx = np.random.choice(X_train.shape[0], size=min(len(y_val), len(y_train)), replace=False)
             X_train_subset, y_train_subset = X_train[train_subset_idx], y_train[train_subset_idx]
             train_score = model.score(X_train_subset, y_train_subset, params=params)
             metrics["train_accuracy"] = train_score
-        if epoch % log_interval == 0 and 'encoder_params' in params and 'W' in params['encoder_params']:
+        if epoch % 100 == 0 and 'encoder_params' in params and 'W' in params['encoder_params']:
             svals = jnp.linalg.svd(params['encoder_params']['W'], compute_uv=False)
             metrics['htsr_alpha'] = estimate_alpha_fit(svals**2)
         
-        # Use the logger object to log the metrics
-        if epoch % log_interval == 0:
+        if epoch % 100 == 0:
             logger.log(metrics, step=epoch)
-        return metrics # Return for progress bar
+        return metrics
     return log_callback
 
 def main():
     parser = argparse.ArgumentParser(description="Train an SVGP classifier on molecular data.")
-    # ... (existing args)
     parser.add_argument("train_file", type=str)
     parser.add_argument("test_file", type=str)
     parser.add_argument("--learning_rate", type=float, default=1e-5)
@@ -182,41 +125,36 @@ def main():
     parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--random_seed", type=int, default=42)
     
-    # --- New/Modified Logging Arguments ---
-    parser.add_argument("--logger", type=str, default="csv", choices=["tensorboard", "wandb", "csv"], help="Logging backend to use.")
-    parser.add_argument("--log_interval", type=int, default=100, help="Number of epochs between logging steps.")
-    parser.add_argument("--log_dir", type=str, default="logs", help="Directory for TensorBoard or CSV logs.")
-    parser.add_argument("--wandb_project", type=str, default="grokking_chemistry", help="Weights & Biases project name.")
-    parser.add_argument("--wandb_run_name", type=str, default="experiment", help="A name for this specific W&B run.")
+    # --- Logging Arguments ---
+    parser.add_argument("--log_dir", type=str, default="logs", help="Directory for CSV logs.")
+    parser.add_argument("--run_name", type=str, default=None, help="A name for this specific run (overrides automatic naming).")
 
     args = parser.parse_args()
     key = jax.random.PRNGKey(args.random_seed)
 
-    # --- Setup Logger ---
-    if args.logger == "wandb":
-        logger = WandbLogger(config=vars(args), run_name=args.wandb_run_name, project_name=args.wandb_project)
-    elif args.logger == "tensorboard":
-        logger = TensorBoardLogger(config=vars(args), run_name=args.wandb_run_name, log_dir=args.log_dir)
-    else: # csv
-        logger = CSVLogger(config=vars(args), run_name=args.wandb_run_name, log_dir=args.log_dir)
+    # --- Determine Run Name from UniProt ID ---
+    if args.run_name:
+        run_name = args.run_name
+    else:
+        target_id = os.path.basename(os.path.dirname(args.train_file))
+        run_name = f"{target_id}-seed{args.random_seed}"
 
-    # --- THE FIX: Use a try...finally block to guarantee logger cleanup ---
+    # --- Setup Logger ---
+    logger = CSVLogger(config=vars(args), run_name=run_name, log_dir=args.log_dir)
+
     try:
-        # --- Load and filter data ---
         print("Loading and filtering data...")
         x_train_df = pl.read_csv(args.train_file).filter(pl.col('smiles').is_not_null() & (pl.col('smiles') != ""))
         x_test_df = pl.read_csv(args.test_file).filter(pl.col('smiles').is_not_null() & (pl.col('smiles') != ""))
         print(f"Found {len(x_train_df)} valid training molecules.")
         print(f"Found {len(x_test_df)} valid test molecules.")
         
-        # --- Featurize Data ---
         X_train = featurize_smiles(x_train_df['smiles'].to_list(), model_name=args.featurizer_model)
         X_test = featurize_smiles(x_test_df['smiles'].to_list(), model_name=args.featurizer_model)
         y_train = x_train_df['active'].to_numpy()
         y_test = x_test_df['active'].to_numpy()
 
-        # --- Setup and Train Model ---
-        callback = log_callback_factory(X_train, y_train, X_test, y_test, logger, args.log_interval)
+        callback = log_callback_factory(X_train, y_train, X_test, y_test, logger)
         key, encoder_key, hparam_key = jax.random.split(key, 3)
         encoder = LinearEncoder(encoder_key, X_train.shape[-1], args.encoder_dim)
         
@@ -237,9 +175,10 @@ def main():
         print("Training complete.")
 
     finally:
-        # This block will execute no matter how the 'try' block exits
         print("Finalizing logger...")
         logger.finish()
 
 if __name__ == '__main__':
     main()
+
+

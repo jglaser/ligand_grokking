@@ -6,14 +6,9 @@ from tqdm.auto import tqdm
 from multiprocessing import Pool, cpu_count
 from scipy.stats import pearsonr
 
-# Define the logging frequency from the training script
 LOG_FREQ = 100
 
 def find_initial_generalization_epoch(epochs, val_acc, generalization_threshold=0.60, window_size=20):
-    """
-    Finds the first epoch where the smoothed validation accuracy sustainably
-    crosses a defined threshold.
-    """
     window_steps = max(1, window_size // LOG_FREQ)
     if len(val_acc) < window_steps:
         return -1
@@ -28,9 +23,6 @@ def find_grokking_point_vectorized(epochs, train_acc, val_acc,
                                    overfit_threshold=0.9, plateau_threshold=0.75,
                                    jump_threshold=0.05, window_size=50,
                                    min_delay_epochs=500, sustain_window_multiplier=3):
-    """
-    Analyzes a training trajectory for a grokking event using vectorized operations.
-    """
     window_steps = max(1, window_size // LOG_FREQ)
     min_delay_steps = max(1, min_delay_epochs // LOG_FREQ)
     required_len = window_steps * (sustain_window_multiplier + 1)
@@ -72,26 +64,10 @@ def find_grokking_point_vectorized(epochs, train_acc, val_acc,
     else:
         return memorization_epoch, -1
 
-def read_tensorboard_log(log_dir: str) -> pd.DataFrame | None:
-    """Reads scalar data from a TensorBoard log directory."""
-    try:
-        from tensorboard.backend.event_processing import event_accumulator
-        ea = event_accumulator.EventAccumulator(log_dir, size_guidance={event_accumulator.SCALARS: 0})
-        ea.Reload()
-        required_tags = {'train_accuracy', 'validation_accuracy'}
-        if not required_tags.issubset(ea.Tags()['scalars']): return None
-        df_train = pd.DataFrame([(e.step, e.value) for e in ea.Scalars('train_accuracy')], columns=['epoch', 'train_accuracy'])
-        df_val = pd.DataFrame([(e.step, e.value) for e in ea.Scalars('validation_accuracy')], columns=['epoch', 'validation_accuracy'])
-        return pd.merge(df_train, df_val, on='epoch', how='outer').sort_values('epoch').ffill().dropna()
-    except Exception:
-        return None
-
-# --- NEW: Function to read from a CSV log file ---
 def read_csv_log(log_file: str) -> pd.DataFrame | None:
     """Reads training history from a CSV file."""
     try:
         df = pd.read_csv(log_file)
-        # Check for required columns
         required_cols = {'epoch', 'train_accuracy', 'validation_accuracy'}
         if not required_cols.issubset(df.columns):
             return None
@@ -101,16 +77,10 @@ def read_csv_log(log_file: str) -> pd.DataFrame | None:
 
 def analyze_log_worker(log_path: str):
     """
-    Universal worker that can analyze a log from either TensorBoard or CSV format.
+    Worker to analyze a single CSV log file.
     """
     run_name = os.path.basename(log_path).replace('.csv', '')
-    history = None
-    
-    # --- FIX: Try reading as a directory (TensorBoard) first, then as a file (CSV) ---
-    if os.path.isdir(log_path):
-        history = read_tensorboard_log(log_path)
-    elif os.path.isfile(log_path) and log_path.endswith('.csv'):
-        history = read_csv_log(log_path)
+    history = read_csv_log(log_path)
     
     if history is None: return {'run_name': run_name, 'status': 'failed_read'}
     if history.empty or len(history) < 100: return {'run_name': run_name, 'status': 'too_short'}
@@ -134,17 +104,15 @@ def analyze_log_worker(log_path: str):
     }
 
 def main():
-    parser = argparse.ArgumentParser(description="Analyze a directory of logs (TensorBoard or CSV) for grokking events.")
-    # ... (the rest of the main function remains the same)
-    parser.add_argument("log_dir", type=str, help="Path to the log directory containing run subdirectories or CSV files.")
+    parser = argparse.ArgumentParser(description="Analyze a directory of CSV logs for grokking events.")
+    parser.add_argument("log_dir", type=str, help="Path to the log directory containing run CSV files.")
     parser.add_argument("dataset_summary_file", type=str, help="Path to the dataset_split_summary.csv file.")
     parser.add_argument("--output_file", type=str, default="grokking_analysis_summary.csv", help="Name for the output summary CSV file.")
     args = parser.parse_args()
     
-    # --- FIX: The script now finds both directories and .csv files ---
     try:
-        run_paths = [os.path.join(args.log_dir, d) for d in sorted(os.listdir(args.log_dir)) 
-                     if os.path.isdir(os.path.join(args.log_dir, d)) or d.endswith('.csv')]
+        run_paths = [os.path.join(args.log_dir, f) for f in sorted(os.listdir(args.log_dir)) 
+                     if f.endswith('.csv')]
     except FileNotFoundError:
         print(f"Error: Log directory not found at '{args.log_dir}'")
         return
@@ -172,9 +140,8 @@ def main():
         
         try:
             dataset_summary_df = pd.read_csv(args.dataset_summary_file)
-            summary_df['pdb_id'] = summary_df['run_name'].apply(lambda x: x.split('-seed')[0])
-            merge_col = 'uniprot_id' if 'uniprot_id' in dataset_summary_df.columns else 'pdb_id'
-            summary_df = pd.merge(summary_df, dataset_summary_df[[merge_col, 'num_scaffolds']], left_on='pdb_id', right_on=merge_col, how='left')
+            summary_df['uniprot_id'] = summary_df['run_name'].apply(lambda x: x.split('-seed')[0])
+            summary_df = pd.merge(summary_df, dataset_summary_df[['uniprot_id', 'num_scaffolds']], on='uniprot_id', how='left')
         except FileNotFoundError:
             print(f"Warning: Dataset summary file not found at '{args.dataset_summary_file}'. Scaffold counts will not be included.")
         except Exception as e:
@@ -183,15 +150,6 @@ def main():
         summary_df.to_csv(args.output_file, index=False)
         print(f"\nAnalysis complete. Summary saved to: {args.output_file}")
         
-        if 'num_scaffolds' in summary_df.columns and 'grokking_detected' in summary_df.columns:
-            analysis_df = summary_df.dropna(subset=['num_scaffolds', 'grokking_detected'])
-            if len(analysis_df) > 2:
-                correlation, p_value = pearsonr(analysis_df['num_scaffolds'], analysis_df['grokking_detected'].astype(int))
-                print("\n--- Correlation Analysis ---")
-                print(f"Pearson correlation between Number of Scaffolds and Grokking Event:")
-                print(f"  - Correlation Coefficient: {correlation:.4f}")
-                print(f"  - P-value: {p_value:.4f}")
-                print("--------------------------")
     else:
         print("\nNo valid runs with sufficient data were found to analyze.")
         
@@ -205,3 +163,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
