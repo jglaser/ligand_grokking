@@ -37,7 +37,7 @@ def main():
     print(f"Created a comprehensive feature set for {len(features_df)} PDBs with complete features.")
 
     # --- THE CHANGE: The run name now directly contains the UniProt ID ---
-    grokking_df['uniprot_id'] = grokking_df['run_name'].apply(lambda x: x.split('-seed')[0])
+    grokking_df['uniprot_id'] = grokking_df['run_name'].apply(lambda x: x.split('-')[0])
     uniprot_ids_in_runs = grokking_df['uniprot_id'].dropna().unique()
     print(f"Identified {len(uniprot_ids_in_runs)} unique UniProt targets present in the grokking runs.")
 

@@ -140,7 +140,7 @@ def main():
         
         try:
             dataset_summary_df = pd.read_csv(args.dataset_summary_file)
-            summary_df['uniprot_id'] = summary_df['run_name'].apply(lambda x: x.split('-seed')[0])
+            summary_df['uniprot_id'] = summary_df['run_name'].apply(lambda x: x.split('-')[0])
             summary_df = pd.merge(summary_df, dataset_summary_df[['uniprot_id', 'num_scaffolds']], on='uniprot_id', how='left')
         except FileNotFoundError:
             print(f"Warning: Dataset summary file not found at '{args.dataset_summary_file}'. Scaffold counts will not be included.")
