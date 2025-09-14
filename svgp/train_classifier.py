@@ -19,13 +19,16 @@ class BaseLogger:
 
 class CSVLogger(BaseLogger):
     """A logger that saves metrics to a CSV file."""
-    def __init__(self, config, run_name, log_dir="logs"):
+    def __init__(self, config, log_file):
+        # --- THE CHANGE: Now takes the full file path directly ---
+        run_name = os.path.basename(log_file).replace('.csv', '')
         super().__init__(config, run_name)
-        self.log_dir = log_dir
-        self.log_file = os.path.join(self.log_dir, f"{self.run_name}.csv")
+        
+        self.log_file = log_file
         self.log_data = []
-        # Ensure log directory exists
-        os.makedirs(self.log_dir, exist_ok=True)
+        # Ensure the directory for the log file exists
+        log_dir = os.path.dirname(self.log_file)
+        os.makedirs(log_dir, exist_ok=True)
 
     def log(self, metrics, step):
         """Stores metrics in memory to be written to file upon completion."""
@@ -37,24 +40,19 @@ class CSVLogger(BaseLogger):
         """Converts logged data to a DataFrame and saves as a CSV."""
         if self.log_data:
             df = pd.DataFrame(self.log_data)
-            # Ensure consistent column order
             cols = ['epoch', 'train_accuracy', 'validation_accuracy', 'htsr_alpha']
             df = df.reindex(columns=[c for c in cols if c in df.columns])
             df.to_csv(self.log_file, index=False)
             print(f"CSV log for '{self.run_name}' saved to: {self.log_file}")
 
-# Local import of your classifier
+# (The rest of the helper functions and classes remain the same)
 from svgp_classifier import SparseVariationalGPClassifier
-
-# --- Encoder Definition ---
 class LinearEncoder:
     def __init__(self, key, input_dim, output_dim):
         self.params = {'W': jax.random.normal(key, shape=(input_dim, output_dim)) * jnp.sqrt(2.0 / input_dim)}
         self.output_dim = output_dim
     def __call__(self, params, x):
         return x @ params['W']
-
-# --- HTSR Alpha Calculation (Robust MLE Method) ---
 def estimate_alpha_fit(data):
     data = np.asarray(data)
     data = data[data > 1e-9]
@@ -76,8 +74,6 @@ def estimate_alpha_fit(data):
         if ks_stat < best_ks:
             best_ks, best_alpha = ks_stat, alpha
     return best_alpha
-
-# --- Featurization ---
 from transformers import pipeline
 def featurize_smiles(smiles_list, model_name, batch_size=64, max_length=512):
     print(f"Loading feature extractor model: {model_name}...")
@@ -90,8 +86,6 @@ def featurize_smiles(smiles_list, model_name, batch_size=64, max_length=512):
         batch_features = np.stack([t[0].numpy().mean(axis=0) for t in outputs])
         all_features.append(batch_features)
     return np.vstack(all_features)
-
-# --- Logging Callback ---
 def log_callback_factory(X_train, y_train, X_val, y_val, logger):
     def log_callback(model, epoch, metrics, params, bias_state):
         if epoch % 100 == 0:
@@ -125,22 +119,14 @@ def main():
     parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--random_seed", type=int, default=42)
     
-    # --- Logging Arguments ---
-    parser.add_argument("--log_dir", type=str, default="logs", help="Directory for CSV logs.")
-    parser.add_argument("--run_name", type=str, default=None, help="A name for this specific run (overrides automatic naming).")
+    # --- THE CHANGE: Consolidated logging arguments ---
+    parser.add_argument("--log_file", type=str, required=True, help="Full path for the output CSV log file.")
 
     args = parser.parse_args()
     key = jax.random.PRNGKey(args.random_seed)
 
-    # --- Determine Run Name from UniProt ID ---
-    if args.run_name:
-        run_name = args.run_name
-    else:
-        target_id = os.path.basename(os.path.dirname(args.train_file))
-        run_name = f"{target_id}-seed{args.random_seed}"
-
     # --- Setup Logger ---
-    logger = CSVLogger(config=vars(args), run_name=run_name, log_dir=args.log_dir)
+    logger = CSVLogger(config=vars(args), log_file=args.log_file)
 
     try:
         print("Loading and filtering data...")

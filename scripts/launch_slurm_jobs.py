@@ -25,7 +25,7 @@ def generate_slurm_script(job_name: str, account: str, time: str, nodes_per_job:
 #SBATCH -e slurm/%A_%a.err
 
 # --- Environment Setup (MODIFY THIS SECTION) ---
-# ...
+#...
 
 echo "Job Array Task $SLURM_ARRAY_TASK_ID starting on $(hostname)"
 echo "SLURM Job ID: $SLURM_JOB_ID"
@@ -67,12 +67,12 @@ def main():
 
     # --- 1. Find PDB IDs & Create Full Task List ---
     try:
-        pdb_ids = sorted([d for d in os.listdir(args.datasets_dir) if os.path.isdir(os.path.join(args.datasets_dir, d))])
+        uniprot_ids = sorted([d for d in os.listdir(args.datasets_dir) if os.path.isdir(os.path.join(args.datasets_dir, d))])
     except FileNotFoundError:
         print(f"Error: Datasets directory not found at '{args.datasets_dir}'")
         return
 
-    tasks = [f"{p},{s},{lr},{ed}" for p, s, lr, ed in itertools.product(pdb_ids, seeds, learning_rates, encoder_dims)]
+    tasks = [f"{p},{s},{lr},{ed}" for p, s, lr, ed in itertools.product(uniprot_ids, seeds, learning_rates, encoder_dims)]
     print(f"Generated a total of {len(tasks)} unique training tasks.")
 
     # --- 2. Generate a SINGLE hash for the entire campaign ---
@@ -90,6 +90,7 @@ def main():
         # Use the single campaign hash for all task files
         task_file = f"task_list_chunk_{chunk_num}_{campaign_hash}.txt"
         with open(task_file, 'w') as f:
+            f.write("target,random_seed,learning_rate,encoder_dim\n")
             f.write("\n".join(chunk))
 
     # --- 5. Generate a Single SLURM Submission Script for the Array ---

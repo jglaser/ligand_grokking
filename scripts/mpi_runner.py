@@ -1,92 +1,119 @@
-import os
+import argparse
+import itertools
 import subprocess
+import os
 from mpi4py import MPI
 from mpi4py.futures import MPICommExecutor
-import argparse
-from itertools import repeat
+from tqdm.auto import tqdm
+import pandas as pd
 
-def run_training_task(task_tuple):
+def run_task(task: dict):
     """
-    This is the worker function that runs a single training job.
-    It's executed by a worker process in the MPI pool.
+    Constructs and runs a training command based on a task dictionary.
     """
-    # Unpack the full tuple, which now includes non-swept campaign parameters
-    task_line, datasets_dir, epochs, n_inducing_points, log_dir = task_tuple
-    comm = MPI.COMM_WORLD
-    rank = comm.Get_rank()
-    local_rank = int(os.environ.get('SLURM_LOCALID', rank % 8))
+    target_id = task['target']
+    lr = task['learning_rate']
+    edim = task['encoder_dim']
+    seed = task['random_seed']
+    log_dir = task['log_dir']
+
+    # Construct a descriptive run name and full log file path
+    run_name = f"{target_id}-lr{lr}-edim{edim}-seed{seed}"
+    log_file = os.path.join(log_dir, f"{run_name}.csv")
+
+    # Construct the base command
+    command = [
+        "python", "../svgp/train_classifier.py",
+        os.path.join(task['dataset_dir'], target_id, "train.csv"),
+        os.path.join(task['dataset_dir'], target_id, "test.csv"),
+        "--learning_rate", str(lr),
+        "--encoder_dim", str(edim),
+        "--random_seed", str(seed),
+        "--log_file", log_file
+    ]
     
+    # Add optional arguments from the task
+    if 'n_inducing_points' in task:
+        command.extend(["--n_inducing_points", str(task['n_inducing_points'])])
+    if 'temperature' in task:
+        command.extend(["--temperature", str(task['temperature'])])
+    if 'epochs' in task:
+        command.extend(["--epochs", str(task['epochs'])])
+    if 'batch_size' in task:
+        command.extend(["--batch_size", str(task['batch_size'])])
+
+    # This function now returns the result instead of printing,
+    # as stdout can get messy with MPI.
     try:
-        # Parse the extended task line containing swept hyperparameters
-        uniprot_id, seed, learning_rate, encoder_dim = task_line.split(',')
-        
-        print(f"Rank {rank} (Local rank {local_rank}) starting task: Uniprot={uniprot_id}, Seed={seed}, LR={learning_rate}, EncDim={encoder_dim}", flush=True)
-        
-        train_file = os.path.join(datasets_dir, uniprot_id, "train.csv")
-        test_file = os.path.join(datasets_dir, uniprot_id, "test.csv")
-        
-        # Create a more descriptive run name including the hyperparameters
-        run_name = f"{uniprot_id}-seed{seed}-lr{learning_rate}-ed{encoder_dim}"
-
-        if not os.path.exists(train_file) or not os.path.exists(test_file):
-            print(f"Rank {rank} skipping task {uniprot_id}: Dataset files not found.", flush=True)
-            return f"Skipped: {uniprot_id}"
-
-        command = [
-            "python", "../svgp/train_classifier.py", train_file, test_file,
-            "--random_seed", str(seed),
-            # Use hyperparameters from the task list
-            "--learning_rate", str(learning_rate),
-            "--encoder_dim", str(encoder_dim),
-            # Use non-swept hyperparameters passed from the runner's main function
-            "--n_inducing_points", str(n_inducing_points),
-            "--epochs", str(epochs),
-            "--log_dir", log_dir
-        ]
-        subprocess.run(command, check=True)
-        print(f"Rank {rank} successfully completed task: PDB={uniprot_id}, Seed={seed}", flush=True)
-        return f"Success: {uniprot_id}"
-    except Exception as e:
-        print(f"Rank {rank} FAILED task: {task_line}. Error: {e}", flush=True)
-        return f"Failed: {task_line}"
+        # We use DEVNULL to hide the verbose output of the training script
+        subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return f"SUCCESS: {run_name}"
+    except subprocess.CalledProcessError as e:
+        return f"FAILURE: {run_name} exited with code {e.returncode}"
 
 def main():
-    parser = argparse.ArgumentParser(description="MPI runner for training jobs.")
-    # Arguments that are constant for the entire campaign
-    parser.add_argument("--datasets_dir", type=str, required=True)
-    parser.add_argument("--task_list", type=str, required=True)
-    parser.add_argument("--epochs", type=int, default=200000)
-    parser.add_argument("--n_inducing_points", type=int, default=100)
-    parser.add_argument("--log_dir", type=str, default="logs", help="Base directory for local TensorBoard logs.")
-
+    parser = argparse.ArgumentParser(description="Run a hyperparameter sweep using MPI.")
+    parser.add_argument("--datasets_dir", type=str, default="datasets", help="Parent directory containing the dataset subdirectories.")
+    # --- THE CHANGE: Task list is now a CSV with hyperparameters ---
+    parser.add_argument("--task_list", type=str, required=True, help="Path to a CSV file defining tasks (target, learning_rate, encoder_dim, random_seed).")
+    parser.add_argument("--log_dir", type=str, default="logs_mpi", help="Parent directory to save all output CSV logs.")
+    
     args = parser.parse_args()
-    comm = MPI.COMM_WORLD
-    rank = comm.Get_rank()
 
-    with MPICommExecutor(comm, root=0) as executor:
-        if executor is not None:
-            print(f"Manager (Rank 0) started with {comm.Get_size() - 1} workers.")
-            try:
-                with open(args.task_list, 'r') as f: tasks = f.read().strip().split('\n')
-            except FileNotFoundError:
-                print(f"Error: Task list '{args.task_list}' not found.")
-                tasks = []
-            
-            if tasks:
-                # Prepare tuples for the worker function, including the non-swept parameters
-                task_tuples = zip(
-                    tasks, 
-                    repeat(args.datasets_dir),
-                    repeat(args.epochs),
-                    repeat(args.n_inducing_points),
-                    repeat(args.log_dir)
-                )
-                results = executor.map(run_training_task, task_tuples)
-                completed_count = sum(1 for _ in results)
-                print(f"Manager (Rank 0): All {completed_count}/{len(tasks)} tasks processed.")
+    # Use MPICommExecutor for task distribution
+    with MPICommExecutor(MPI.COMM_WORLD, root=0) as executor:
+        if executor is None:
+            # Worker processes will wait here for tasks.
+            return
 
-    if rank == 0:
-        print("Manager (Rank 0): Job complete.")
+        # The rest of the code is executed only on the root process (rank 0)
+        
+        # 1. Generate tasks from the CSV file
+        tasks = []
+        try:
+            task_df = pd.read_csv(args.task_list)
+            # Convert dataframe rows to a list of dictionaries
+            tasks = task_df.to_dict('records')
+            # Add static arguments to each task
+            for task in tasks:
+                task['dataset_dir'] = args.datasets_dir
+                task['log_dir'] = args.log_dir
+
+        except FileNotFoundError:
+            print(f"Error: Task list file not found at '{args.task_list}'")
+            tasks = []
+        except Exception as e:
+            print(f"Error reading or processing task file: {e}")
+            tasks = []
+
+        os.makedirs(args.log_dir, exist_ok=True)
+        
+        # 2. Map tasks to workers and collect results with a progress bar
+        print(f"Root process distributing {len(tasks)} tasks to workers...")
+        results = []
+        # Use tqdm to create a progress bar for the map operation
+        for result in tqdm(executor.map(run_task, tasks), total=len(tasks)):
+            results.append(result)
+        
+        # 3. Process results
+        print("\n--- MPI Run Summary ---")
+        success_count = 0
+        failure_count = 0
+        
+        for res in results:
+            # Print failures for easier debugging
+            if res.startswith("FAILURE"):
+                print(res)
+            if res.startswith("SUCCESS"):
+                success_count += 1
+            else:
+                failure_count += 1
+        print("-----------------------")
+        print(f"Total tasks: {len(tasks)}")
+        print(f"Successful runs: {success_count}")
+        print(f"Failed runs: {failure_count}")
+        print("-----------------------")
+
 
 if __name__ == "__main__":
     main()
