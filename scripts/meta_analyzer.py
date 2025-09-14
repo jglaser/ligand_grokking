@@ -32,31 +32,23 @@ def main():
         print(f"Error: Could not find a required file: {e.filename}")
         return
 
-    # --- 2. Correctly Calculate Pocket Statistics for Target Families ---
-
-    # First, create a comprehensive feature table for ALL PDBs by merging the two feature files.
-    # An inner join ensures we only consider PDBs that were successfully characterized by both methods.
+    # --- 2. Calculate Pocket Statistics for Target Families ---
     features_df = pd.merge(pocket_df_initial, fpocket_df, on='pdb_id', how='inner')
     print(f"Created a comprehensive feature set for {len(features_df)} PDBs with complete features.")
 
-    # Second, identify the unique UniProt IDs that are actually in our experiment.
-    grokking_df['pdb_id'] = grokking_df['run_name'].apply(lambda x: x.split('-seed')[0])
-    # Map the PDBs from the grokking runs to their UniProt IDs using the initial metadata file.
-    run_uniprot_map = pd.merge(grokking_df[['pdb_id']], pocket_df_initial[['pdb_id', 'uniprot_id']], on='pdb_id', how='left')
-    uniprot_ids_in_runs = run_uniprot_map['uniprot_id'].dropna().unique()
+    # --- THE CHANGE: The run name now directly contains the UniProt ID ---
+    grokking_df['uniprot_id'] = grokking_df['run_name'].apply(lambda x: x.split('-seed')[0])
+    uniprot_ids_in_runs = grokking_df['uniprot_id'].dropna().unique()
     print(f"Identified {len(uniprot_ids_in_runs)} unique UniProt targets present in the grokking runs.")
 
-    # Third, filter our comprehensive feature set to include all PDBs belonging to these target families.
     relevant_features_df = features_df[features_df['uniprot_id'].isin(uniprot_ids_in_runs)]
-
-    # --- Data Sparsity Diagnostic ---
+    
     pdb_counts_per_uniprot = relevant_features_df.groupby('uniprot_id')['pdb_id'].nunique()
     print("\n--- Data Sparsity Diagnostic ---")
     print("Number of PDBs per UniProt target (for all relevant targets):")
     print(pdb_counts_per_uniprot.value_counts().sort_index().to_string())
     print("--------------------------------\n")
 
-    # Fourth, aggregate the features for these complete target families.
     feature_cols = [
         'num_residues', 'volume_A3', 'hydrophobic_sasa_nm2',
         'hbond_donors', 'hbond_acceptors', 'net_charge', 'polarity_score',
@@ -77,11 +69,8 @@ def main():
     pocket_statistics[std_cols] = pocket_statistics[std_cols].fillna(0)
     print(f"Calculated pocket statistics for {len(pocket_statistics)} UniProt families.")
 
-    # --- 3. Separately, Aggregate Grokking Results ---
-    # We use the previously created run_uniprot_map to ensure we group by the correct UniProt ID for each run.
-    grokking_with_uniprot = pd.merge(grokking_df, run_uniprot_map.drop_duplicates(), on='pdb_id', how='left').dropna(subset=['uniprot_id'])
-    
-    grokking_summary = grokking_with_uniprot.groupby('uniprot_id').agg(
+    # --- 3. Aggregate Grokking Results ---
+    grokking_summary = grokking_df.groupby('uniprot_id').agg(
         grokking_frequency=('grokking_detected', 'mean'),
         average_grokking_delay=('grokking_delay', lambda x: x[x != -1].mean()),
         average_initial_generalization_epoch=('initial_generalization_epoch', lambda x: x[x != -1].mean())
@@ -132,3 +121,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
