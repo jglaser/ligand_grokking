@@ -8,7 +8,7 @@ from scipy.stats import pearsonr
 
 LOG_FREQ = 100
 
-def find_initial_generalization_epoch(epochs, val_acc, generalization_threshold=0.60, window_size=20):
+def find_initial_generalization_epoch(epochs, val_acc, generalization_threshold=0.75, window_size=20):
     window_steps = max(1, window_size // LOG_FREQ)
     if len(val_acc) < window_steps:
         return -1
@@ -21,7 +21,7 @@ def find_initial_generalization_epoch(epochs, val_acc, generalization_threshold=
 
 def find_grokking_point_vectorized(epochs, train_acc, val_acc,
                                    overfit_threshold=0.9, plateau_threshold=0.75,
-                                   jump_threshold=0.05, window_size=50,
+                                   jump_threshold=0.05, window_size=500,
                                    min_delay_epochs=500, sustain_window_multiplier=3):
     window_steps = max(1, window_size // LOG_FREQ)
     min_delay_steps = max(1, min_delay_epochs // LOG_FREQ)
@@ -68,7 +68,7 @@ def read_csv_log(log_file: str) -> pd.DataFrame | None:
     """Reads training history from a CSV file."""
     try:
         df = pd.read_csv(log_file)
-        required_cols = {'epoch', 'train_accuracy', 'validation_accuracy'}
+        required_cols = {'epoch', 'train_auc', 'validation_auc'}
         if not required_cols.issubset(df.columns):
             return None
         return df.sort_values('epoch').ffill().dropna()
@@ -86,8 +86,8 @@ def analyze_log_worker(log_path: str):
     if history.empty or len(history) < 100: return {'run_name': run_name, 'status': 'too_short'}
     
     epochs = history["epoch"].values
-    train_acc = history["train_accuracy"].values
-    val_acc = history["validation_accuracy"].values
+    train_acc = history["train_auc"].values
+    val_acc = history["validation_auc"].values
 
     initial_gen_epoch = find_initial_generalization_epoch(epochs, val_acc)
     mem_epoch, grok_epoch = find_grokking_point_vectorized(epochs, train_acc, val_acc)
