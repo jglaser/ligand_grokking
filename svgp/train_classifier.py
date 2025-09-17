@@ -93,6 +93,7 @@ def featurize_proteins(sequence_list, model_name, batch_size=16, max_length=2048
     from transformers import AutoModel, AutoTokenizer
     model = AutoModel.from_pretrained(model_name, trust_remote_code=True)
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    model = model.to(device)
     model = torch.compile(model, backend=compile_backend)
 
     print("Featurizing Protein Sequences...")
