@@ -8,6 +8,7 @@ import os
 from collections import defaultdict
 from tqdm.auto import tqdm
 import concurrent.futures
+import numpy as np
 
 def get_scaffold(smiles_string: str) -> str | None:
     """Computes the Murcko scaffold for a given SMILES string."""
@@ -76,6 +77,9 @@ def main():
     parser.add_argument("--mode", type=str, choices=['easy', 'hard'], required=True, help="Dataset construction mode.")
     parser.add_argument("--n_total_actives", type=int, default=10000, help="Total number of active compounds to include in the final dataset.")
     parser.add_argument("--output_dir", type=str, default='.', help="Directory to save the generated dataset files.")
+    # --- NEW: Argument to limit pocket cluster diversity ---
+    parser.add_argument("--max_pocket_clusters", type=int, default=None, help="Randomly select a subset of this many pocket clusters to build datasets from.")
+    parser.add_argument('--random_seed', type=int, default=42, help="Random number generator seed")
     
     args = parser.parse_args()
 
@@ -91,7 +95,6 @@ def main():
         binding_lazy = pl.scan_delta(args.bindingdb_delta_path)
         lazy_schema_names = binding_lazy.collect_schema().names()
 
-        # --- THE FIX: Efficiently Canonicalize SMILES First ---
         print("Collecting unique raw SMILES for parallel canonicalization...")
         raw_smiles_list = binding_lazy.select(pl.col("Ligand SMILES")).collect()['Ligand SMILES'].drop_nulls().unique().to_list()
 
@@ -99,12 +102,10 @@ def main():
         with concurrent.futures.ProcessPoolExecutor() as executor:
             results = list(tqdm(executor.map(canonicalize_smiles_worker, raw_smiles_list), total=len(raw_smiles_list), desc="Canonicalizing"))
         
-        # Create a mapping DataFrame from raw to canonical SMILES
         canonical_map_df = pl.DataFrame(
             [{"raw_smiles": raw, "canonical_smiles": can} for raw, can in results if can is not None]
         ).lazy()
         
-        # --- Continue with the main Polars query plan ---
         base_cols = {
             'uniprot_id': 'UniProt (SwissProt) Primary ID of Target Chain',
             'sequence': 'BindingDB Target Chain Sequence'
@@ -122,7 +123,6 @@ def main():
         ]
         binding_lazy = binding_lazy.with_columns(pl.min_horizontal(activity_exprs).alias("activity"))
         
-        # Join the canonicalization map back to the main dataframe
         binding_lazy = binding_lazy.rename({"Ligand SMILES": "raw_smiles"})
         binding_lazy = binding_lazy.join(canonical_map_df, on="raw_smiles", how="inner").with_columns(
             pl.col('uniprot_id').str.strip_chars()
@@ -158,6 +158,15 @@ def main():
     sampled_actives = pd.DataFrame()
     
     actives_with_clusters = actives_df.dropna(subset=['pocket_cluster_id'])
+
+    # --- THE CHANGE: Limit the number of pocket clusters if requested ---
+    available_pocket_clusters = actives_with_clusters['pocket_cluster_id'].unique()
+    if args.max_pocket_clusters and len(available_pocket_clusters) > args.max_pocket_clusters:
+        print(f"Randomly selecting {args.max_pocket_clusters} out of {len(available_pocket_clusters)} available pocket clusters.")
+        rng = np.random.default_rng(seed=args.random_seed)
+        selected_clusters = rng.choice(available_pocket_clusters, size=args.max_pocket_clusters, replace=False)
+        actives_with_clusters = actives_with_clusters[actives_with_clusters['pocket_cluster_id'].isin(selected_clusters)]
+
     grouped_pockets = actives_with_clusters.groupby('pocket_cluster_id')
     
     if len(grouped_pockets) == 0:
@@ -178,7 +187,7 @@ def main():
             n_to_sample = min(samples_per_pocket_cluster, len(final_subset))
             sampled_actives = pd.concat([
                 sampled_actives, 
-                final_subset.sample(n=n_to_sample, random_state=42)
+                final_subset.sample(n=n_to_sample, random_state=args.random_seed)
             ])
 
     elif args.mode == 'hard':
@@ -194,7 +203,7 @@ def main():
             diverse_samples = pocket_group_with_lig_clusters.groupby('ligand_cluster_id').sample(
                 n=samples_per_ligand_cluster, 
                 replace=True, 
-                random_state=42
+                random_state=args.random_seed,
             )
             sampled_actives = pd.concat([sampled_actives, diverse_samples])
 
@@ -209,14 +218,14 @@ def main():
         print(f"Warning: Not enough inactive compounds ({len(inactives_df)}) to create a fully balanced dataset. Using all available inactives.")
         n_inactives_to_sample = len(inactives_df)
 
-    sampled_inactives = inactives_df.sample(n=n_inactives_to_sample, random_state=42)
+    sampled_inactives = inactives_df.sample(n=n_inactives_to_sample, random_state=args.random_seed)
     print(f"Sampled {len(sampled_inactives)} inactive compounds.")
     
     final_dataset = pd.concat([sampled_actives, sampled_inactives])
 
     # --- 3. Create Final Train/Test Splits ---
     print("\nCreating final train/test splits...")
-    train_df, test_df = stratified_scaffold_split(final_dataset)
+    train_df, test_df = stratified_scaffold_split(final_dataset, random_state=args.random_seed)
     
     if train_df.empty or test_df.empty:
         print("Error: Could not create valid train/test splits.")
