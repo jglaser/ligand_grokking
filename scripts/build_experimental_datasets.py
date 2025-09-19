@@ -55,11 +55,30 @@ def stratified_scaffold_split(df, stratify_col='active', test_size=0.2, random_s
     
     return df.loc[train_indices], df.loc[test_indices]
 
+# --- NEW: Function for splitting by pocket cluster ---
+def pocket_cluster_split(df, test_size=0.2, random_state=42):
+    """
+    Performs a train/test split by holding out entire pocket clusters.
+    This is a more rigorous test of generalization to new target families.
+    """
+    all_clusters = df['pocket_cluster_id'].unique()
+    
+    if len(all_clusters) < 2:
+        # Not enough clusters to split, fallback to scaffold split
+        print("Warning: Only one pocket cluster found. Falling back to scaffold split.")
+        return stratified_scaffold_split(df, test_size=test_size, random_state=random_state)
+
+    train_clusters, test_clusters = train_test_split(all_clusters, test_size=test_size, random_state=random_state)
+    
+    train_df = df[df['pocket_cluster_id'].isin(train_clusters)]
+    test_df = df[df['pocket_cluster_id'].isin(test_clusters)]
+    
+    return train_df, test_df
+
 
 def canonicalize_smiles_worker(smiles: str) -> tuple[str, str | None]:
     """
     Safely canonicalizes a single SMILES string for parallel processing.
-    Returns the original and the canonical SMILES.
     """
     try:
         mol = Chem.MolFromSmiles(smiles)
@@ -77,13 +96,14 @@ def main():
     parser.add_argument("--mode", type=str, choices=['easy', 'hard'], required=True, help="Dataset construction mode.")
     parser.add_argument("--n_total_actives", type=int, default=10000, help="Total number of active compounds to include in the final dataset.")
     parser.add_argument("--output_dir", type=str, default='.', help="Directory to save the generated dataset files.")
-    # --- NEW: Argument to limit pocket cluster diversity ---
-    parser.add_argument("--max_pocket_clusters", type=int, default=None, help="Randomly select a subset of this many pocket clusters to build datasets from.")
+    parser.add_argument("--max_pocket_clusters", type=int, default=None, help="Randomly select a subset of this many pocket clusters.")
+    # --- NEW: Argument to control the final splitting strategy ---
+    parser.add_argument("--split_by", type=str, default="pocket_cluster", choices=["scaffold", "pocket_cluster"], help="Method for the final train/test split.")
     parser.add_argument('--random_seed', type=int, default=42, help="Random number generator seed")
     
     args = parser.parse_args()
 
-    # --- 1. Load and Merge All Data using a Hybrid Polars/Pandas Approach ---
+    # --- 1. Load and Merge All Data ---
     try:
         print("Building lazy query plan with Polars...")
         
@@ -156,10 +176,8 @@ def main():
         return
 
     sampled_actives = pd.DataFrame()
-    
     actives_with_clusters = actives_df.dropna(subset=['pocket_cluster_id'])
 
-    # --- THE CHANGE: Limit the number of pocket clusters if requested ---
     available_pocket_clusters = actives_with_clusters['pocket_cluster_id'].unique()
     if args.max_pocket_clusters and len(available_pocket_clusters) > args.max_pocket_clusters:
         print(f"Randomly selecting {args.max_pocket_clusters} out of {len(available_pocket_clusters)} available pocket clusters.")
@@ -207,6 +225,7 @@ def main():
             )
             sampled_actives = pd.concat([sampled_actives, diverse_samples])
 
+
     print(f"Sampled {len(sampled_actives)} active compounds.")
 
     if sampled_actives.empty:
@@ -215,7 +234,7 @@ def main():
 
     n_inactives_to_sample = len(sampled_actives)
     if len(inactives_df) < n_inactives_to_sample:
-        print(f"Warning: Not enough inactive compounds ({len(inactives_df)}) to create a fully balanced dataset. Using all available inactives.")
+        print(f"Warning: Not enough inactive compounds ({len(inactives_df)}) to create a fully balanced dataset.")
         n_inactives_to_sample = len(inactives_df)
 
     sampled_inactives = inactives_df.sample(n=n_inactives_to_sample, random_state=args.random_seed)
@@ -224,8 +243,11 @@ def main():
     final_dataset = pd.concat([sampled_actives, sampled_inactives])
 
     # --- 3. Create Final Train/Test Splits ---
-    print("\nCreating final train/test splits...")
-    train_df, test_df = stratified_scaffold_split(final_dataset, random_state=args.random_seed)
+    print(f"\nCreating final train/test splits using '{args.split_by}' strategy...")
+    if args.split_by == 'scaffold':
+        train_df, test_df = stratified_scaffold_split(final_dataset, random_state=args.random_seed)
+    elif args.split_by == 'pocket_cluster':
+        train_df, test_df = pocket_cluster_split(final_dataset, random_state=args.random_seed)
     
     if train_df.empty or test_df.empty:
         print("Error: Could not create valid train/test splits.")

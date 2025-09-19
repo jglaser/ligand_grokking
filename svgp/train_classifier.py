@@ -61,6 +61,7 @@ def featurize_smiles(smiles_list, model_name, batch_size=64, max_length=512):
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     model = model.to(device)
     model = torch.compile(model, backend=compile_backend)
+    model.eval()
 
     print("Featurizing SMILES...")
     all_features = []
@@ -95,6 +96,7 @@ def featurize_proteins(sequence_list, model_name, batch_size=16, max_length=2048
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     model = model.to(device)
     model = torch.compile(model, backend=compile_backend)
+    model.eval()
 
     print("Featurizing Protein Sequences...")
     sequences_with_spaces = [" ".join(list(seq)) for seq in sequence_list]
