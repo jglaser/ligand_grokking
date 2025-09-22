@@ -1,89 +1,70 @@
 import argparse
-import pandas as pd
+import polars as pl
 from scipy.cluster.hierarchy import linkage, fcluster
 from sklearn.preprocessing import StandardScaler
+from loguru import logger
 from pathlib import Path
-import numpy as np
 
 def create_protein_hierarchy_labels(
     pocket_features_path: Path,
     metadata_path: Path,
     output_path: Path,
-    max_clusters: int = 20
+    max_clusters: int = 50
 ):
     """
-    Performs hierarchical clustering at the UniProt ID level by aggregating
-    pocket features from multiple PDB structures.
-
-    This creates a lookup table of cluster memberships for multiple hierarchy
-    levels (k=2 to max_clusters) for each unique protein.
-
-    Args:
-        pocket_features_path: Path to the fpocket_descriptors.csv file.
-        metadata_path: Path to the target_pocket_metadata.csv file.
-        output_path: Path to save the output CSV file with protein hierarchy labels.
-        max_clusters: The maximum number of clusters to generate labels for.
+    Performs hierarchical clustering at the UniProt ID level and saves a single,
+    compact, semicolon-delimited hierarchy path string for each protein.
     """
-    print("Loading pocket features and metadata...")
-    pocket_df = pd.read_csv(pocket_features_path)
-    meta_df = pd.read_csv(metadata_path)
+    logger.info("Loading pocket features and metadata...")
+    # Assuming the first column of pocket_features_path is the target identifier
+    pocket_df = pl.read_csv(pocket_features_path)
+    meta_df = pl.read_csv(metadata_path)
 
-    print("Merging features with UniProt ID metadata...")
-    merged_df = pd.merge(pocket_df, meta_df[['pdb_id', 'uniprot_id']], on='pdb_id')
-
-    # Drop rows where uniprot_id is missing, as they cannot be clustered
-    merged_df.dropna(subset=['uniprot_id'], inplace=True)
-    
-    # Identify feature columns (all columns except pdb_id and uniprot_id)
+    logger.info("Merging features with UniProt ID metadata...")
+    merged_df = pocket_df.join(meta_df.select(["pdb_id", "uniprot_id"]), on='pdb_id', how="inner")
     feature_cols = [col for col in pocket_df.columns if col != 'pdb_id']
     
-    print("Aggregating pocket features by UniProt ID (using mean)...")
-    # Group by uniprot_id and calculate the mean for each feature column
-    protein_features_df = merged_df.groupby('uniprot_id')[feature_cols].mean().reset_index()
+    logger.info("Aggregating pocket features by UniProt ID...")
+    protein_features_df = merged_df.group_by('uniprot_id').agg(
+        [pl.mean(col) for col in feature_cols]
+    ).sort("uniprot_id")
 
-    print(f"Aggregated {len(merged_df)} PDBs into {len(protein_features_df)} unique UniProt IDs.")
+    uniprot_ids = protein_features_df['uniprot_id']
+    features = protein_features_df.drop('uniprot_id').to_numpy()
 
-    # Prepare data for clustering
-    uniprot_ids = protein_features_df['uniprot_id'].values
-    features = protein_features_df[feature_cols].values
-
-    print("Standardizing aggregated features...")
+    logger.info("Standardizing and clustering features...")
     scaler = StandardScaler()
     scaled_features = scaler.fit_transform(features)
-
-    print("Performing hierarchical clustering on UniProt IDs...")
     Z = linkage(scaled_features, method='ward')
 
-    # Create a DataFrame to store the final results
-    hierarchy_df = pd.DataFrame({'uniprot_id': uniprot_ids})
+    logger.info(f"Generating hierarchy paths for k=2 to k={max_clusters}...")
+    # Generate all cluster labels into a matrix
+    # Each column corresponds to a k-level (k=2, k=3, ...)
+    all_labels_matrix = [
+        fcluster(Z, t=k, criterion='maxclust')
+        for k in range(2, max_clusters + 1)
+    ]
 
-    print(f"Generating cluster labels for k=2 to k={max_clusters}...")
-    for k in range(2, max_clusters + 1):
-        labels = fcluster(Z, t=k, criterion='maxclust')
-        hierarchy_df[f'k{k}_cluster'] = labels
+    # Transpose and convert to strings to create the path for each protein
+    path_strings = [
+        ";".join(map(str, row))
+        for row in zip(*all_labels_matrix)
+    ]
 
-    # Save the hierarchy to the specified output file
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    hierarchy_df.to_csv(output_path, index=False)
-    print(f"✅ Protein hierarchy labels saved to {output_path}")
+    # Create the final, lean DataFrame
+    hierarchy_df = pl.DataFrame({
+        "uniprot_id": uniprot_ids,
+        "hierarchy_path": path_strings
+    })
 
+    hierarchy_df.write_csv(output_path)
+    logger.info(f"✅ Lean protein hierarchy labels saved to {output_path}")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Generate hierarchical cluster labels for UniProt IDs from pocket features."
-    )
-    parser.add_argument(
-        "--pocket_features_path", type=Path, default="../data/fpocket_descriptors.csv"
-    )
-    parser.add_argument(
-        "--metadata_path", type=Path, default="../data/target_pocket_metadata.csv"
-    )
-    parser.add_argument(
-        "--output_path", type=Path, default="protein_hierarchy_labels.csv"
-    )
-    parser.add_argument(
-        "--max_clusters", type=int, default=20
-    )
+    parser = argparse.ArgumentParser(description="Create lean protein hierarchy labels.")
+    parser.add_argument("pocket_features_path", type=Path)
+    parser.add_argument("metadata_path", type=Path)
+    parser.add_argument("output_path", type=Path)
+    parser.add_argument("--max_clusters", type=int, default=5000)
     args = parser.parse_args()
-
     create_protein_hierarchy_labels(**vars(args))

@@ -1,0 +1,9 @@
+[
+    {
+        "split_method": "protein_hierarchy",
+        "hierarchy_levels": [3, 5, 10, 15],
+        "n_folds": 5,
+        "max_actives_per_target": 20,
+        "max_test_actives_per_target": 20
+    }
+]

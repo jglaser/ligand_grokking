@@ -6,171 +6,182 @@ from pathlib import Path
 import polars as pl
 from loguru import logger
 from tqdm import tqdm
+import numpy as np
+import shutil
 
-
-def get_protein_hierarchy_splits(hierarchy_df, k, n_folds):
-    """
-    Generates train/test UniProt ID splits for a given hierarchy level (k) and number of folds.
-    """
-    cluster_col = f"k{k}_cluster"
-    if cluster_col not in hierarchy_df.columns:
-        raise ValueError(f"Hierarchy for k={k} not found.")
-
-    unique_clusters = hierarchy_df[cluster_col].unique().sort()
-    cluster_to_fold = {
-        cluster_id: (i % n_folds) for i, cluster_id in enumerate(unique_clusters)
-    }
-
-    for fold_idx in range(n_folds):
-        test_clusters = [
-            cid for cid, f_idx in cluster_to_fold.items() if f_idx == fold_idx
-        ]
-        if not test_clusters:
-            continue
-
-        test_uniprots = hierarchy_df.filter(pl.col(cluster_col).is_in(test_clusters))[
-            "uniprot_id"
-        ].to_list()
-        train_uniprots = hierarchy_df.filter(
-            ~pl.col(cluster_col).is_in(test_clusters)
-        )["uniprot_id"].to_list()
-
-        yield (fold_idx, train_uniprots, test_uniprots)
+# Suppress RDKit warnings, as we handle them
+from rdkit import RDLogger
+RDLogger.DisableLog("rdApp.*")
 
 
 def define_and_deduplicate(df: pl.DataFrame, affinity_cols: list) -> pl.DataFrame:
-    """
-    Computes pchembl_value, defines a binary is_active label based on a
-    per-UniProt ID threshold, and removes duplicate SMILES for each target.
-    """
+    """Defines activity labels and removes duplicate SMILES."""
     logger.info("Defining activity labels and de-duplicating...")
-
-    df = df.with_columns(
-        pl.coalesce(affinity_cols).alias("affinity_nM")
-    ).filter(pl.col("affinity_nM").is_not_null() & (pl.col("affinity_nM") > 0))
-
-    df = df.with_columns(
-        (-pl.col("affinity_nM").log10() + 9).alias("pchembl_value")
-    )
-
-    uniprot_thresholds = df.group_by("uniprot_id").agg(
-        pl.col("pchembl_value").median().alias("activity_threshold")
-    )
-
-    df = df.join(uniprot_thresholds, on="uniprot_id", how="left")
-    df = df.with_columns(
-        (pl.col("pchembl_value") >= pl.col("activity_threshold")).alias("is_active")
-    )
-    
-    n_before = len(df)
+    df = df.with_columns(pl.coalesce(affinity_cols).alias("affinity_nM")).filter(pl.col("affinity_nM").is_not_null() & (pl.col("affinity_nM") > 0))
+    df = df.with_columns((-pl.col("affinity_nM").log10() + 9).alias("pchembl_value"))
+    thresholds = df.group_by("uniprot_id").agg(pl.col("pchembl_value").median().alias("activity_threshold"))
+    df = df.join(thresholds, on="uniprot_id", how="left")
+    df = df.with_columns((pl.col("pchembl_value") >= pl.col("activity_threshold")).alias("is_active"))
     df = df.unique(subset=["uniprot_id", "canonical_smiles"], keep="first")
-    n_after = len(df)
-    logger.info(f"Removed {n_before - n_after} duplicate SMILES per target.")
-
     return df
 
+def sample_set(df_pool: pl.DataFrame, max_per_target: int | float | None, use_scaffolds: bool) -> pl.DataFrame:
+    """Samples a dataframe to a max number of actives/inactives per target."""
+    if max_per_target is None:
+        return df_pool
 
-def main(
-    config_path: Path,
-    delta_lake_path: Path,
-    output_path: Path,
-    hierarchy_labels_path: Path,
-):
-    """
-    Main function to build experimental datasets based on a config file.
-    """
-    with open(config_path) as f:
-        configs = json.load(f)
+    sampled_dfs = []
+    original_columns = df_pool.columns
 
-    logger.info(f"Reading main data from Delta Lake at {delta_lake_path}")
-    main_df = pl.read_delta(delta_lake_path)
+    for _, target_df in df_pool.group_by("uniprot_id"):
+        actives = target_df.filter(pl.col("is_active"))
+        inactives = target_df.filter(~pl.col("is_active"))
+        
+        sampled_actives = pl.DataFrame()
+        if len(actives) > 0:
+            if isinstance(max_per_target, float):
+                n_samples = int(len(actives) * max_per_target)
+                with_replacement = True
+            else: # is int
+                n_samples = min(len(actives), max_per_target)
+                with_replacement = False
 
-    if "uniprot_id" not in main_df.columns:
-        raise ValueError("Input Delta Lake table must contain a 'uniprot_id' column.")
-    main_df = main_df.filter(pl.col("uniprot_id").is_not_null())
+            if use_scaffolds and not with_replacement:
+                scaffold_reps = actives.group_by("scaffold").head(1)
+                remaining_actives = actives.join(scaffold_reps.select("canonical_smiles"), on="canonical_smiles", how="anti")
+                
+                n_from_scaffolds = min(len(scaffold_reps), n_samples)
+                sampled_scaffold_actives = scaffold_reps.sample(n=n_from_scaffolds, shuffle=True)
+                
+                n_remaining = n_samples - n_from_scaffolds
+                if n_remaining > 0 and len(remaining_actives) > 0:
+                    additional_sample = remaining_actives.sample(n=min(len(remaining_actives), n_remaining), shuffle=True)
+                    sampled_actives = pl.concat([
+                        sampled_scaffold_actives.select(original_columns),
+                        additional_sample.select(original_columns)
+                    ])
+                else:
+                    sampled_actives = sampled_scaffold_actives
+            else:
+                sampled_actives = actives.sample(n=n_samples, with_replacement=with_replacement, shuffle=True)
+        
+        n_to_sample_inactives = len(sampled_actives)
+        sampled_inactives = inactives.sample(n=min(len(inactives), n_to_sample_inactives), shuffle=True)
+        
+        if len(sampled_actives) > 0: sampled_dfs.append(sampled_actives.select(original_columns))
+        if len(sampled_inactives) > 0: sampled_dfs.append(sampled_inactives.select(original_columns))
 
-    affinity_cols = [
-        "Ki (nM)", "IC50 (nM)", "Kd (nM)", "EC50 (nM)", "kon (M-1-s-1)", "koff (s-1)"
+    return pl.concat(sampled_dfs) if sampled_dfs else pl.DataFrame()
+
+def main(config_path: Path, delta_lake_path: Path, output_path: Path, hierarchy_labels_path: Path):
+    with open(config_path) as f: configs = json.load(f)
+
+    logger.info(f"Reading main data from {delta_lake_path}")
+    main_df = pl.read_delta(delta_lake_path).filter(pl.col("uniprot_id").is_not_null())
+    main_df = define_and_deduplicate(main_df, ["Ki (nM)", "IC50 (nM)", "Kd (nM)", "EC50 (nM)"])
+
+    logger.info(f"Reading protein hierarchy from {hierarchy_labels_path}")
+    hierarchy_df = pl.read_csv(hierarchy_labels_path)
+
+    logger.info("Parsing hierarchy path string into columns...")
+    path_splits = hierarchy_df["hierarchy_path"].str.split(";")
+    max_level_in_file = len(path_splits[0]) + 1
+
+    cluster_cols = [
+        path_splits.list.get(k-2).cast(pl.Int32).alias(f"k{k}_cluster")
+        for k in range(2, max_level_in_file + 1)
     ]
-    main_df = define_and_deduplicate(main_df, affinity_cols)
+    hierarchy_df = hierarchy_df.with_columns(cluster_cols).drop("hierarchy_path")
+
+    main_df = main_df.join(hierarchy_df, on="uniprot_id", how="inner")
 
     for config in configs:
-        split_method = config["split_method"]
-        max_actives_per_target = config.get("max_actives_per_target", None)
+        max_train = config.get("max_actives_per_target", None)
+        max_test = config.get("max_test_actives_per_target", None)
+        output_levels = set(config.get("hierarchy_levels", []))
+        max_level_config = max(output_levels) if output_levels else 0
 
-        if split_method == "protein_hierarchy":
-            logger.info("Starting 'protein_hierarchy' split method.")
-            if max_actives_per_target:
-                logger.info(f"Applying limit of {max_actives_per_target} actives/inactives per target for training sets.")
+        max_level_to_cull = min(max_level_config, max_level_in_file)
+        if max_level_config > max_level_in_file:
+            logger.warning(
+                f"Config requests culling up to k={max_level_config}, but file only contains levels up to k={max_level_in_file}. Culling will stop there."
+            )
 
-            hierarchy_df = pl.read_csv(hierarchy_labels_path)
-            hierarchy_levels = config.get("hierarchy_levels", [])
-            n_folds_config = config.get("n_folds", 5)
+        n_folds_config = config.get("n_folds", 5)
+        n_stochastic_splits = config.get("n_stochastic_splits", 1)
 
-            for k in hierarchy_levels:
-                actual_n_folds = min(n_folds_config, k)
-                if actual_n_folds < n_folds_config:
-                    logger.warning(f"For k={k}, number of folds is capped at {k}.")
-                
-                logger.info(f"--- Generating splits for k={k} with {actual_n_folds} folds ---")
-                split_generator = get_protein_hierarchy_splits(hierarchy_df, k, actual_n_folds)
-                fold_iterator = tqdm(split_generator, total=actual_n_folds, desc=f"k={k} Folds")
+        logger.info(f"Generating {n_stochastic_splits} stochastic splits, culling up to k={max_level_to_cull}.")
 
-                for fold_idx, train_uniprots, test_uniprots in fold_iterator:
-                    split_name = f"protein_hierarchy_k{k}_fold{fold_idx+1}of{actual_n_folds}"
-                    split_output_path = output_path / split_name
+        rng = np.random.default_rng(seed=42)
 
-                    if split_output_path.exists():
-                        logger.warning(f"Path {split_output_path} exists. Skipping.")
-                        continue
-                    os.makedirs(split_output_path)
+        for i in range(n_stochastic_splits):
+            split_name = f"stochastic_split_{i+1}"
+            split_path = output_path / split_name
+            if split_path.exists(): continue
+            os.makedirs(split_path)
 
-                    test_df = main_df.filter(pl.col("uniprot_id").is_in(test_uniprots))
-                    if len(test_df) > 0:
-                        test_df.write_parquet(split_output_path / "test.parquet")
+            logger.info(f"--- Creating {split_name} ---")
+
+            current_pool = main_df
+            last_successful_test_pool = None
+            last_successful_train_pool = None
+            last_successful_k = -1
+
+            for k in tqdm(range(2, max_level_to_cull + 1), desc="Culling Hierarchy"):
+                if current_pool.is_empty(): break
+
+                cluster_col = f"k{k}_cluster"
+
+                available_clusters = current_pool[cluster_col].unique().drop_nulls().to_list()
+
+                if len(available_clusters) > 1:
+                    rng.shuffle(available_clusters)
+                    n_to_hold_out = max(1, len(available_clusters) // n_folds_config)
+                    test_cluster_ids = available_clusters[:n_to_hold_out]
+
+                    test_pool = current_pool.filter(pl.col(cluster_col).is_in(test_cluster_ids))
+
+                    uniprots_to_exclude = test_pool.select("uniprot_id")
+                    train_pool = current_pool.join(uniprots_to_exclude, on="uniprot_id", how="anti")
+
+                    last_successful_test_pool = test_pool
+                    last_successful_train_pool = train_pool
+                    last_successful_k = k
+
+                    current_pool = train_pool
+
+                if k in output_levels:
+                    if last_successful_k != -1:
+                        # --- DEFINITIVE FIX: Use explicit filenames for carried-over splits ---
+                        from_k_str = f"_from_k{last_successful_k}" if last_successful_k != k else ""
+                        if from_k_str:
+                             logger.info(f"  - Level k={k} is unsplittable, using last successful split from k={last_successful_k}.")
+
+                        test_df = sample_set(last_successful_test_pool, max_test, use_scaffolds=False)
+                        train_df_level = sample_set(last_successful_train_pool, max_train, use_scaffolds=True)
+
+                        if len(test_df) > 0:
+                            test_df.write_parquet(split_path / f"k{k}{from_k_str}_test.parquet")
+
+                        if len(train_df_level) > 0:
+                            train_df_level.write_parquet(split_path / f"k{k}{from_k_str}_train.parquet")
                     else:
-                        logger.warning(f"Test set is empty for {split_name}.")
+                        logger.warning(f"  - No successful splits occurred yet, cannot write output for k={k}.")
 
-                    train_pool = main_df.filter(pl.col("uniprot_id").is_in(train_uniprots))
-                    
-                    if max_actives_per_target is None:
-                        train_df = train_pool
-                    else:
-                        train_dfs_per_target = []
-                        for target_id in train_uniprots:
-                            target_df = train_pool.filter(pl.col("uniprot_id") == target_id)
-                            actives = target_df.filter(pl.col("is_active"))
-                            inactives = target_df.filter(~pl.col("is_active"))
+            # Save the final training set
+            if last_successful_k != -1:
+                final_train_df = sample_set(last_successful_train_pool, max_train, use_scaffolds=True)
+                if len(final_train_df) > 0:
+                    final_train_df.write_parquet(split_path / "train.parquet")
+                    logger.info(f"  - Final train.parquet is the remainder from the k={last_successful_k} split.")
 
-                            sampled_actives = actives.sample(n=min(len(actives), max_actives_per_target), shuffle=True)
-                            n_to_sample = len(sampled_actives)
-                            sampled_inactives = inactives.sample(n=min(len(inactives), n_to_sample), shuffle=True)
-
-                            if len(sampled_actives) > 0:
-                                train_dfs_per_target.append(sampled_actives)
-                            if len(sampled_inactives) > 0:
-                                train_dfs_per_target.append(sampled_inactives)
-                        
-                        if not train_dfs_per_target:
-                            train_df = pl.DataFrame()
-                        else:
-                            train_df = pl.concat(train_dfs_per_target)
-
-                    if len(train_df) > 0:
-                        train_df.write_parquet(split_output_path / "train.parquet")
-                    else:
-                        logger.warning(f"Train set is empty for {split_name}.")
-
-                    logger.info(f"✅ Saved split: {split_name}")
-        else:
-            raise ValueError(f"Unknown split_method: '{split_method}'")
-
+            logger.info(f"✅ Finished {split_name}")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Build experimental datasets from a Delta Lake table.")
-    parser.add_argument("--config_path", type=Path, required=True, help="Path to the JSON config file.")
-    parser.add_argument("--delta_lake_path", type=Path, required=True, help="Path to the input Delta Lake directory.")
-    parser.add_argument("--output_path", type=Path, required=True, help="Root directory for output splits.")
-    parser.add_argument("--hierarchy_labels_path", type=Path, default="protein_hierarchy_labels.csv", help="Path to the protein hierarchy labels file.")
+    parser = argparse.ArgumentParser(description="Build stochastic, manifestly leak-proof datasets.")
+    parser.add_argument("--config_path", type=Path, required=True)
+    parser.add_argument("--delta_lake_path", type=Path, required=True)
+    parser.add_argument("--output_path", type=Path, required=True)
+    parser.add_argument("--hierarchy_labels_path", type=Path, default="protein_hierarchy_labels.csv")
     args = parser.parse_args()
     main(**vars(args))
