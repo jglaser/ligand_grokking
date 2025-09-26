@@ -16,15 +16,15 @@ from sklearn.metrics import roc_auc_score
 # =============================================================================
 # 1. DATA PREPARATION AND DATASET
 # =============================================================================
-def prepare_shards(df, smiles_map, protein_archive_path, shard_dir):
-    print(f"--- Preparing ultimate performance cache in {shard_dir} ---")
+def prepare_shards(df, smiles_map, protein_archive_path, shard_dir, df_type='train'):
+    print(f"--- Preparing {df_type} shards and global feature stores in {shard_dir} ---")
     if os.path.exists(shard_dir):
         shutil.rmtree(shard_dir)
     os.makedirs(shard_dir, exist_ok=True)
     
     protein_archive = np.load(protein_archive_path)
     
-    print("Creating global unique feature stores...")
+    print(f"[{df_type}] Creating global unique feature stores...")
     unique_smiles = df['Ligand SMILES'].unique()
     unique_proteins = df['target_id'].unique()
     
@@ -38,13 +38,14 @@ def prepare_shards(df, smiles_map, protein_archive_path, shard_dir):
     with open(os.path.join(shard_dir, 'protein_index.json'), 'w') as f:
         json.dump(protein_to_global_idx, f)
 
-    print("Converting DataFrame columns to fast NumPy arrays...")
+    print(f"[{df_type}] Converting DataFrame columns to fast NumPy arrays...")
     np.save(os.path.join(shard_dir, 'df_ligand_smiles.npy'), df['Ligand SMILES'].values)
     np.save(os.path.join(shard_dir, 'df_target_ids.npy'), df['target_id'].values)
     np.save(os.path.join(shard_dir, 'df_labels.npy'), df['is_effective_against_mutant'].values.astype(np.int64))
         
-    print("✅ Cache preparation complete.")
+    print(f"✅ {df_type.capitalize()} cache preparation complete.")
 
+   
 class ShardedDataset(Dataset):
     def __init__(self, shard_dir):
         self.shard_dir = shard_dir
@@ -52,6 +53,7 @@ class ShardedDataset(Dataset):
         self.df_ligand_smiles, self.df_target_ids, self.df_labels = None, None, None
         self.global_ligand_vectors, self.global_protein_vectors = None, None
         self.smiles_to_global_idx, self.protein_to_global_idx = None, None
+
         self._len = len(np.load(os.path.join(self.shard_dir, 'df_labels.npy'), mmap_mode='r'))
 
     def __len__(self):
@@ -90,17 +92,15 @@ class ShardedDataset(Dataset):
 
     @staticmethod
     def worker_init_fn(worker_id):
-        """
-        FIX: Robust initialization function for each DataLoader worker.
-        """
         worker_info = torch.utils.data.get_worker_info()
         dataset = worker_info.dataset
         dataset._load_stores()
-
+ 
 # =============================================================================
 # 2. GPU-NATIVE SCALER AND CLASSIFIER
 # =============================================================================
 class GPUStandardScaler:
+    # (Unchanged)
     def __init__(self, device=None):
         self.device = device if device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.mean_ = None
@@ -144,14 +144,19 @@ class GPUStandardScaler:
         return self
 
 class _LogisticModule(nn.Module):
+    # (Unchanged)
     def __init__(self, n_features):
         super().__init__()
         self.linear = nn.Linear(n_features, 1)
+        # --- FINAL OPTIMIZATION: COMPILE THE MODEL ---
+        print("Compiling model with torch.compile()...")
+        self.linear = torch.compile(self.linear)
 
     def forward(self, x):
         return self.linear(x)
 
 class PyTorchLogisticRegression:
+    # (Unchanged)
     def __init__(self, learning_rate=0.001, alpha=0.0001, l1_ratio=0.15,
                  random_seed=42, dtype='float32', quant_scale=None, device=None,
                  predict_batch_size=4096):
@@ -172,13 +177,7 @@ class PyTorchLogisticRegression:
         self.device_ = torch.device(self.device)
         self.classes_, self.n_features_in_ = torch.unique(y), X.shape[1]
         model_dtype = torch.float32 if self.dtype == 'int8' else self.dtype_
-        
-        # Instantiate the base model
-        model = _LogisticModule(self.n_features_in_).to(device=self.device_, dtype=model_dtype)
-        # --- THE FINAL OPTIMIZATION: COMPILE THE MODEL ---
-        print("Compiling model with torch.compile()...")
-        self.model_ = torch.compile(model)
-        
+        self.model_ = _LogisticModule(self.n_features_in_).to(device=self.device_, dtype=model_dtype)
         self.optimizer_ = optim.Adam(self.model_.parameters(), lr=self.learning_rate)
         self.criterion_ = nn.BCEWithLogitsLoss()
         if self.dtype == 'int8':
@@ -201,7 +200,6 @@ class PyTorchLogisticRegression:
         if self.alpha > 0:
             l1_penalty = sum(torch.linalg.vector_norm(p, ord=1) for p in self.model_.parameters() if p.dim() > 1)
             l2_penalty = sum(torch.linalg.vector_norm(p, ord=2).pow(2) for p in self.model_.parameters() if p.dim() > 1)
-            # --- FIX: Corrected typo from l1_ratio * l1_ratio to self.l1_ratio ---
             loss += self.alpha * (self.l1_ratio * l1_penalty + (1 - self.l1_ratio) * 0.5 * l2_penalty)
         
         loss.backward()
@@ -249,51 +247,78 @@ def main(args):
     start_time = time.time()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    # --- Load and filter data ONCE ---
     print("--- Loading and filtering dataframes ---")
-    train_df_full = pd.read_parquet(args.train_data)
-    train_df_full['target_id'] = train_df_full['uniprot_id'] + '_' + train_df_full['mutation']
+    train_df = pd.read_parquet(args.train_data)
+    train_df['target_id'] = train_df['uniprot_id'] + '_' + train_df['mutation']
+    
     with np.load(args.protein_features_path) as archive:
         available_targets = set(archive.files)
-    train_df = train_df_full[train_df_full['target_id'].isin(available_targets)].reset_index(drop=True)
+    train_df = train_df[train_df['target_id'].isin(available_targets)].reset_index(drop=True)
     
+    if args.test_data:
+        test_df = pd.read_parquet(args.test_data)
+        test_df['target_id'] = test_df['uniprot_id'] + '_' + test_df['mutation']
+        test_df = test_df[test_df['target_id'].isin(available_targets)].reset_index(drop=True)
+
+    # --- Phase 0: Automatic Caching for Shards ---
     if args.shard_dir is None:
         base_dir = os.path.dirname(args.train_data)
         args.shard_dir = os.path.join(base_dir, "shard_cache")
     
-    canary_file = os.path.join(args.shard_dir, 'unique_ligands.npy')
-    
-    regen_needed = not os.path.exists(canary_file)
-    if not regen_needed:
-        if os.path.getmtime(args.train_data) > os.path.getmtime(canary_file) or \
-           os.path.getmtime(args.protein_features_path) > os.path.getmtime(canary_file):
-            regen_needed = True
+    # Train cache
+    train_shard_dir = os.path.join(args.shard_dir, 'train')
+    canary_file = os.path.join(train_shard_dir, 'unique_ligands.npy')
+    regen_needed = not os.path.exists(canary_file) or \
+                   os.path.getmtime(args.train_data) > os.path.getmtime(canary_file) or \
+                   os.path.getmtime(args.protein_features_path) > os.path.getmtime(canary_file)
 
     if regen_needed:
+        print("Train shard cache not found or is stale. Regenerating...")
         hf_featurizer = HuggingFaceFeaturizer()
         unique_smiles = train_df['Ligand SMILES'].unique()
         smiles_map = {s: emb for s, emb in zip(unique_smiles, hf_featurizer.featurize(unique_smiles, args.ligand_featurizer, batch_size=args.batch_size))}
-        prepare_shards(train_df, smiles_map, args.protein_features_path, args.shard_dir)
+        prepare_shards(train_df, smiles_map, args.protein_features_path, train_shard_dir, 'train')
     else:
-        print(f"✅ Using existing performance cache at {args.shard_dir}")
+        print(f"✅ Using existing train shard cache at {train_shard_dir}")
 
+    # Test cache
+    if args.test_data:
+        test_shard_dir = os.path.join(args.shard_dir, 'test')
+        canary_file = os.path.join(test_shard_dir, 'unique_ligands.npy')
+        regen_needed = not os.path.exists(canary_file) or \
+                       os.path.getmtime(args.test_data) > os.path.getmtime(canary_file) or \
+                       os.path.getmtime(args.protein_features_path) > os.path.getmtime(canary_file)
+        
+        if regen_needed:
+            print("Test shard cache not found or is stale. Regenerating...")
+            # Re-use featurizer and existing smiles_map if available
+            if 'hf_featurizer' not in locals():
+                hf_featurizer = HuggingFaceFeaturizer()
+
+            unique_smiles = pd.concat([train_df['Ligand SMILES'], test_df['Ligand SMILES']]).unique()
+            smiles_map = {s: emb for s, emb in zip(unique_smiles, hf_featurizer.featurize(unique_smiles, args.ligand_featurizer, batch_size=args.batch_size))}
+            prepare_shards(test_df, smiles_map, args.protein_features_path, test_shard_dir, 'test')
+        else:
+            print(f"✅ Using existing test shard cache at {test_shard_dir}")
+
+    # --- Phase 1: Fitting Scaler ---
     print("\n--- Phase 1: Fitting Scaler ---")
     scaler = GPUStandardScaler(device=device)
-    scaler.fit(train_df, args.shard_dir)
+    scaler.fit(train_df, train_shard_dir)
     print(f"✅ Scaler fit. Total features: {scaler.mean_.shape[0]:,}")
     
+    # --- Phase 2: Training Model ---
     print(f"\n--- Phase 2: Training Model on {device} ---")
     model = PyTorchLogisticRegression(
         device=device, dtype=args.dtype, learning_rate=args.learning_rate,
         alpha=args.alpha, l1_ratio=args.l1_ratio
     )
     
-    train_dataset = ShardedDataset(args.shard_dir)
+    train_dataset = ShardedDataset(train_shard_dir)
     train_loader = DataLoader(
-        train_dataset, 
-        batch_size=args.batch_size, 
-        shuffle=True, 
-        num_workers=args.num_workers, 
-        pin_memory=True, 
+        train_dataset, batch_size=args.batch_size, shuffle=True, 
+        num_workers=args.num_workers, pin_memory=True, 
         persistent_workers=True if args.num_workers > 0 else False,
         worker_init_fn=ShardedDataset.worker_init_fn
     )
@@ -312,8 +337,45 @@ def main(args):
             
             model.partial_fit(X_batch_final, y_batch)
 
-    print("\n--- Phase 3: Evaluating Model ---")
-    
+    # --- Phase 3: Evaluation ---
+    if args.test_data:
+        print("\n--- Phase 3: Evaluating Model ---")
+        test_dataset = ShardedDataset(test_shard_dir)
+        test_loader = DataLoader(
+            test_dataset, batch_size=args.batch_size, shuffle=False,
+            num_workers=args.num_workers, pin_memory=True
+        )
+        
+        all_predictions, all_labels = [], []
+        with torch.no_grad():
+            if not hasattr(model, 'model_'):
+                # Initialize with a dummy batch if no training was done
+                dummy_x, dummy_y = next(iter(test_loader))
+                model._initialize(dummy_x.to(device), dummy_y.to(device))
+
+            model.model_.eval()
+            for X_batch, y_batch in tqdm(test_loader, desc="Predicting"):
+                X_batch, y_batch = X_batch.to(device, non_blocking=True), y_batch.to(device, non_blocking=True)
+                X_batch_scaled = (X_batch - scaler.mean_) / scaler.scale_
+                
+                if model.dtype == 'int8':
+                    X_batch_quantized = torch.clamp(torch.round(X_batch_scaled / model.quant_scale), -128, 127).to(torch.int8)
+                    X_batch_dequant = X_batch_quantized.to(model.model_.linear.weight.dtype) * model.model_.quant_scale_
+                    logits = model.model_(X_batch_dequant)
+                else:
+                    X_batch_final = X_batch_scaled.to(model.dtype_)
+                    logits = model.model_(X_batch_final)
+                
+                probas = torch.sigmoid(logits)
+                all_predictions.append(probas.cpu().numpy())
+                all_labels.append(y_batch.cpu().numpy())
+        
+        predictions = np.concatenate(all_predictions).flatten()
+        y_test = np.concatenate(all_labels).flatten()
+        score = roc_auc_score(y_test, predictions)
+        print("\n--- Results ---")
+        print(f"Test Set ROC AUC Score: {score:.4f}")
+
     total_time = time.time() - start_time
     print(f"\nTotal pipeline time: {total_time:.2f} seconds")
 
@@ -336,6 +398,7 @@ if __name__ == '__main__':
     parser.add_argument('--epochs', type=int, default=5)
     parser.add_argument('--batch_size', type=int, default=4096)
     parser.add_argument('--num_workers', type=int, default=8, help="Number of worker processes for DataLoader")
+    parser.add_argument('--num_shards', type=int, default=64, help="Number of shards to create for the cache.")
     parser.add_argument('--random_seed', type=int, default=42)
     
     args = parser.parse_args()
