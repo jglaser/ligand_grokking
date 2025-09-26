@@ -344,18 +344,7 @@ def main(args):
     print(f"\nSuccessfully generated {len(feature_vectors)} feature vectors.")
 
     print(f"Saving vectors to '{args.output_path}'...")
-    protein_order_map = sorted(feature_vectors.keys())
-    list_of_vectors = [feature_vectors[key] for key in protein_order_map]
-    sparse_matrix = sparse.csr_matrix(list_of_vectors)
-
-    np.savez_compressed(
-        args.output_path,
-        data=sparse_matrix.data,
-        indices=sparse_matrix.indices,
-        indptr=sparse_matrix.indptr,
-        shape=sparse_matrix.shape,
-        mapping=np.array(protein_order_map) # Save map as a NumPy array
-    )
+    np.savez_compressed(args.output_path, **feature_vectors)
     print("--- Done ---")
 
 if __name__ == '__main__':
