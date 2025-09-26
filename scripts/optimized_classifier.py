@@ -343,7 +343,8 @@ def main(args):
         test_dataset = ShardedDataset(test_shard_dir)
         test_loader = DataLoader(
             test_dataset, batch_size=args.batch_size, shuffle=False,
-            num_workers=args.num_workers, pin_memory=True
+            num_workers=args.num_workers, pin_memory=True,
+            worker_init_fn=ShardedDataset.worker_init_fn
         )
         
         all_predictions, all_labels = [], []
