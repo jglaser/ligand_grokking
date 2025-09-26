@@ -15,6 +15,7 @@ Workflow:
 import argparse
 import pandas as pd
 import numpy as np
+from scipy import sparse
 from tqdm.auto import tqdm
 import os
 import re
@@ -227,7 +228,7 @@ def flatten_predictions_to_vector(predictions: dna_output.Output) -> np.ndarray:
             all_values.append(track_data_obj.values.flatten())
     return np.concatenate(all_values) if all_values else np.array([])
 
-def process_uniprot_id(uniprot_id, uniprot_to_mutations, max_transcripts_to_check, api_key):
+def process_uniprot_id(uniprot_id, uniprot_to_mutations, max_transcripts_to_check, feature_type, api_key, random_seed):
     """
     Worker function to process a single UniProt ID.
     Initializes its own API clients to be process-safe.
@@ -237,7 +238,7 @@ def process_uniprot_id(uniprot_id, uniprot_to_mutations, max_transcripts_to_chec
     e_service = Ensembl()
     ag_model_client = dna_client.create(api_key)
     
-    local_delta_vectors = {}
+    local_feature_vectors = {}
 
     try:
         ensembl_gene_id = get_ensembl_gene_id(u_service, uniprot_id)
@@ -260,8 +261,16 @@ def process_uniprot_id(uniprot_id, uniprot_to_mutations, max_transcripts_to_chec
         chromosome = "chr" + gene_data['seq_region_name']
         interval = genome.Interval(chromosome=chromosome, start=pred_start, end=pred_end)
 
-        for mutation in uniprot_to_mutations.get(uniprot_id, []):
-            target_id = f"{uniprot_id}_{mutation}"
+        mutations = uniprot_to_mutations.get(uniprot_id, [])
+
+        if feature_type == 'randomized_delta':
+            rng = np.random.default_rng(random_seed + pred_start) # a unique seed for every WT sequence
+            shuffled_mutations = rng.choice(mutations, size=len(mutations), replace=False)
+        else:
+            shuffled_mutations = mutations
+
+        for mutation, mutation_label  in zip(mutations, shuffled_mutations):
+            target_id = f"{uniprot_id}_{mutation_label}"
             variant_info, reason = get_variant_info(uniprot_seq, transcript, mutation, gene_data['strand'])
             
             if not variant_info:
@@ -284,16 +293,26 @@ def process_uniprot_id(uniprot_id, uniprot_to_mutations, max_transcripts_to_chec
             if variant_predictions:
                 ref_vector = flatten_predictions_to_vector(variant_predictions.reference)
                 alt_vector = flatten_predictions_to_vector(variant_predictions.alternate)
-                
-                if ref_vector.size > 0 and alt_vector.size > 0 and ref_vector.shape == alt_vector.shape:
-                    delta_vector = alt_vector - ref_vector
-                    local_delta_vectors[target_id] = delta_vector
-            time.sleep(0.2) # Add a slightly longer delay to be kind to APIs in parallel
             
+                if feature_type == 'delta' or feature_type == 'randomized_delta':
+                    if ref_vector.size > 0 and alt_vector.size > 0 and ref_vector.shape == alt_vector.shape:
+                        delta_vector = alt_vector - ref_vector
+                        local_feature_vectors[target_id] = delta_vector
+                elif feature_type == 'mutant_only':
+                    if alt_vector.size > 0:
+                        local_feature_vectors[target_id] = alt_vector
+                elif feature_type == 'wt_only':
+                    if ref_vector.size > 0:
+                        local_feature_vectors[target_id] = ref_vector
+                else:
+                    raise ValueError(f"Invalid --feature_type {feature_type}")
+
+            time.sleep(0.2) # Add a slightly longer delay to be kind to APIs in parallel
+
     except Exception as e:
         return f"An unexpected error occurred while processing {uniprot_id}: {e} (Line: {e.__traceback__.tb_lineno})"
 
-    return local_delta_vectors
+    return local_feature_vectors
 
 
 def main(args):
@@ -307,29 +326,45 @@ def main(args):
     api_key = os.environ.get('ALPHAGENOME_API_KEY')
     if not api_key: raise ValueError("ALPHAGENOME_API_KEY not set.")
 
-    delta_vectors = {}
+    feature_vectors = {}
     
     with ProcessPoolExecutor(max_workers=args.num_workers) as executor:
         # Submit all jobs to the pool
-        future_to_uniprot = {executor.submit(process_uniprot_id, uid, uniprot_to_mutations, args.max_transcripts_to_check, api_key): uid for uid in unique_uniprots}
+        future_to_uniprot = {executor.submit(process_uniprot_id, uid, uniprot_to_mutations, args.max_transcripts_to_check,
+                                             args.feature_type, api_key, args.random_seed): uid for uid in unique_uniprots}
         
         # Process results as they complete
         for future in tqdm(as_completed(future_to_uniprot), total=len(unique_uniprots), desc="Processing Proteins"):
             result = future.result()
             if isinstance(result, dict):
-                delta_vectors.update(result)
+                feature_vectors.update(result)
             elif isinstance(result, str): # It's an error message
                 tqdm.write(result)
             
-    print(f"\nSuccessfully generated {len(delta_vectors)} delta vectors.")
+    print(f"\nSuccessfully generated {len(feature_vectors)} feature vectors.")
+
     print(f"Saving vectors to '{args.output_path}'...")
-    np.savez_compressed(args.output_path, **delta_vectors)
+    protein_order_map = sorted(feature_vectors.keys())
+    list_of_vectors = [feature_vectors[key] for key in protein_order_map]
+    sparse_matrix = sparse.csr_matrix(list_of_vectors)
+
+    np.savez_compressed(
+        args.output_path,
+        data=sparse_matrix.data,
+        indices=sparse_matrix.indices,
+        indptr=sparse_matrix.indptr,
+        shape=sparse_matrix.shape,
+        mapping=np.array(protein_order_map) # Save map as a NumPy array
+    )
     print("--- Done ---")
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Generate AlphaGenome delta vectors for mutant proteins.")
     parser.add_argument('--input_paths', nargs='+', required=True, help='Path(s) to the Parquet split files.')
     parser.add_argument('--output_path', type=str, default='mutant_delta_vectors.npz')
+    parser.add_argument('--feature_type', type=str, choices=['delta', 'mutant_only', 'wt_only', 'randomized_delta'],
+                        default='delta'),
+    parser.add_argument('--random_seed', type=int, default=123)
     parser.add_argument('--max_transcripts_to_check', type=int, default=25,
                         help='Maximum number of longest, protein-coding transcripts to check per gene for alignment.')
     parser.add_argument('--num_workers', type=int, default=4,

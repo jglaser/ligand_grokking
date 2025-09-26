@@ -148,7 +148,11 @@ class _LogisticModule(nn.Module):
     def __init__(self, n_features):
         super().__init__()
         self.linear = nn.Linear(n_features, 1)
-        # --- FINAL OPTIMIZATION: COMPILE THE MODEL ---
+
+        with torch.no_grad():
+            self.linear.weight.fill_(0.0)
+            self.linear.bias.fill_(0.0)
+
         print("Compiling model with torch.compile()...")
         self.linear = torch.compile(self.linear)
 
@@ -178,7 +182,7 @@ class PyTorchLogisticRegression:
         self.classes_, self.n_features_in_ = torch.unique(y), X.shape[1]
         model_dtype = torch.float32 if self.dtype == 'int8' else self.dtype_
         self.model_ = _LogisticModule(self.n_features_in_).to(device=self.device_, dtype=model_dtype)
-        self.optimizer_ = optim.Adam(self.model_.parameters(), lr=self.learning_rate)
+        self.optimizer_ = optim.SGD(self.model_.parameters(), lr=self.learning_rate)
         self.criterion_ = nn.BCEWithLogitsLoss()
         if self.dtype == 'int8':
             self.model_.register_buffer('quant_scale_', torch.tensor(self.quant_scale, device=self.device_))
@@ -201,7 +205,7 @@ class PyTorchLogisticRegression:
             l1_penalty = sum(torch.linalg.vector_norm(p, ord=1) for p in self.model_.parameters() if p.dim() > 1)
             l2_penalty = sum(torch.linalg.vector_norm(p, ord=2).pow(2) for p in self.model_.parameters() if p.dim() > 1)
             loss += self.alpha * (self.l1_ratio * l1_penalty + (1 - self.l1_ratio) * 0.5 * l2_penalty)
-        
+
         loss.backward()
         self.optimizer_.step()
         return self
@@ -391,7 +395,7 @@ if __name__ == '__main__':
     
     # Model args
     parser.add_argument('--dtype', type=str, choices=['float32', 'float16', 'bfloat16', 'int8'], default='float32')
-    parser.add_argument('--learning_rate', type=float, default=1e-3)
+    parser.add_argument('--learning_rate', type=float, default=1e-2)
     parser.add_argument('--alpha', type=float, default=1e-4, help="Regularization strength")
     parser.add_argument('--l1_ratio', type=float, default=0.15, help="Elastic Net mixing parameter")
     
