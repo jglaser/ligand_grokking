@@ -18,11 +18,19 @@ def create_protein_hierarchy_labels(
     logger.info("Loading pocket features and metadata...")
     # Assuming the first column of pocket_features_path is the target identifier
     pocket_df = pl.read_csv(pocket_features_path)
-    meta_df = pl.read_csv(metadata_path)
+    meta_df = None
+
+    if metadata_path is not None:
+        meta_df = pl.read_csv(metadata_path)
 
     logger.info("Merging features with UniProt ID metadata...")
-    merged_df = pocket_df.join(meta_df.select(["pdb_id", "uniprot_id"]), on='pdb_id', how="inner")
-    feature_cols = [col for col in pocket_df.columns if col != 'pdb_id']
+
+    if meta_df is not None:
+        merged_df = pocket_df.join(meta_df.select(["pdb_id", "uniprot_id"]), on='pdb_id', how="inner")
+    else:
+        merged_df = pocket_df
+
+    feature_cols = [col for col in pocket_df.columns if col != 'uniprot_id']
     
     logger.info("Aggregating pocket features by UniProt ID...")
     protein_features_df = merged_df.group_by('uniprot_id').agg(
@@ -63,7 +71,7 @@ def create_protein_hierarchy_labels(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Create lean protein hierarchy labels.")
     parser.add_argument("pocket_features_path", type=Path)
-    parser.add_argument("metadata_path", type=Path)
+    parser.add_argument("--metadata_path", type=Path, default=None)
     parser.add_argument("output_path", type=Path)
     parser.add_argument("--max_clusters", type=int, default=5000)
     args = parser.parse_args()

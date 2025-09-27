@@ -1,147 +1,231 @@
+"""
+MODIFIED VERSION of analyze_pockets_fpocket.py from the ligand_grokking repo.
+
+This script is now a complete, standalone tool for generating pocket descriptors
+from a list of targets.
+
+Key Upgrades:
+- Accepts a .parquet or .csv metadata file as input.
+- Processes PDB analysis in parallel to significantly speed up execution.
+- **Skips fpocket analysis if the output file is already cached.**
+- Sets a configurable timeout for each fpocket run to prevent hanging.
+- Parses and processes all comma-separated PDB IDs.
+- Aggregates descriptors using both mean and std to capture pocket flexibility.
+"""
 import argparse
-import subprocess
 import pandas as pd
-from tqdm.auto import tqdm
 import os
-import logging
-import re
+import subprocess
+import requests
+from tqdm.auto import tqdm
+import gzip
 import shutil
-import tempfile
-import concurrent.futures
+import re
+import numpy as np
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
-# --- Setup Basic Logging ---
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(processName)s - %(levelname)s - %(message)s')
-
-def run_and_parse_fpocket(pdb_path: str, pdb_id: str) -> dict | None:
+def normalize_pdb_id(pdb_id: str) -> str | None:
     """
-    Worker function that handles the full process for a single PDB file,
-    including robust, case-insensitive parsing of the fpocket output.
+    Extracts and standardizes a 4-character PDB ID, enforcing lowercase.
     """
-    with tempfile.TemporaryDirectory() as temp_dir:
-        temp_pdb_path = os.path.join(temp_dir, f"{pdb_id.lower()}.pdb")
-        shutil.copy(pdb_path, temp_pdb_path)
+    if not isinstance(pdb_id, str) or not pdb_id.strip():
+        return None
+    match = re.search(r'([a-zA-Z0-9]{4})', pdb_id)
+    if match:
+        return match.group(1).lower()
+    return None
 
+def download_pdb_if_missing(pdb_id, cache_dir):
+    """
+    Checks for a PDB file in the cache. If not found, downloads and unzips it.
+    """
+    pdb_path = os.path.join(cache_dir, f"{pdb_id}.pdb")
+    if not os.path.exists(pdb_path):
+        # Using .upper() for the URL is standard practice for RCSB
+        url = f"https://files.rcsb.org/download/{pdb_id.upper()}.pdb.gz"
+        gz_path = pdb_path + ".gz"
         try:
-            subprocess.run(
-                ['fpocket', '-f', temp_pdb_path],
-                check=True,
-                capture_output=True,
-                text=True,
-                timeout=120
-            )
-        except (subprocess.TimeoutExpired, FileNotFoundError, subprocess.CalledProcessError) as e:
-            logging.error(f"[{pdb_id}] fpocket command failed. Error: {e}")
-            return None
+            response = requests.get(url, timeout=20, stream=True)
+            response.raise_for_status()
+            with open(gz_path, 'wb') as f:
+                shutil.copyfileobj(response.raw, f)
 
-        base_temp_path = os.path.splitext(temp_pdb_path)[0]
-        output_dir = f"{base_temp_path}_out"
-        
-        if not os.path.isdir(output_dir):
-            logging.error(f"[{pdb_id}] Output directory was not created at {output_dir}")
-            return None
+            with gzip.open(gz_path, 'rb') as f_in:
+                with open(pdb_path, 'wb') as f_out:
+                    shutil.copyfileobj(f_in, f_out)
+            os.remove(gz_path)
+        except requests.exceptions.RequestException as e:
+            # This is an expected failure for obsolete/non-existent PDBs
+            if os.path.exists(gz_path):
+                os.remove(gz_path)
+            return None, f"Failed to download {pdb_id.upper()}: {e}"
+    return pdb_path, None
 
-        try:
-            info_file_path = os.path.join(output_dir, f'{pdb_id.lower()}_info.txt')
-            if not os.path.exists(info_file_path):
-                logging.error(f"[{pdb_id}] Info file not found at {info_file_path}")
-                return None
-
-            with open(info_file_path, 'r') as f:
-                content = f.read()
-            
-            pocket1_match = re.search(r'Pocket 1 :\s*\n(.*?)(?=\n\s*\n|\Z)', content, re.S)
-            if not pocket1_match:
-                logging.warning(f"[{pdb_id}] Could not find 'Pocket 1' data block.")
-                return None
-            
-            pocket1_data = pocket1_match.group(1).strip()
-            
-            # --- THE FIX: Case-insensitive parsing with correct keys ---
-            descriptors = {}
-            for line in pocket1_data.split('\n'):
-                if ':' in line:
-                    key, value = line.split(':', 1)
-                    # Standardize the key: lowercase and remove spaces
-                    clean_key = key.strip().lower().replace(' ', '')
-                    try:
-                        descriptors[clean_key] = float(value.strip())
-                    except ValueError:
-                        pass
-            
-            # Map the standardized keys to our desired output columns
-            result_dict = {
-                'pdb_id': pdb_id,
-                'fpocket_drug_score': descriptors.get('druggabilityscore'),
-                'fpocket_volume': descriptors.get('volume'), # Matches 'Volume'
-                'fpocket_hydrophobicity_score': descriptors.get('hydrophobicityscore'), # Matches 'Hydrophobicity score'
-                'fpocket_polarity_score': descriptors.get('polarityscore'), # Matches 'Polarity score'
-                'fpocket_num_alpha_spheres': descriptors.get('numberofalphaspheres') # Matches 'Number of Alpha Spheres'
-            }
-            
-            return result_dict
-
-        except Exception as e:
-            logging.error(f"[{pdb_id}] An unexpected error occurred during parsing: {e}")
-            return None
-
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="Run fpocket in parallel and extract druggability descriptors.",
-        formatter_class=argparse.RawTextHelpFormatter
-    )
-    parser.add_argument("metadata_file", type=str, help="Path to a CSV file with a 'pdb_id' or 'run_name' column.")
-    parser.add_argument("--output_file", type=str, default="fpocket_descriptors.csv", help="Name for the output CSV file.")
-    parser.add_argument("--pdb_cache_dir", type=str, default="pdb_cache", help="Directory where PDB files are stored.")
-    parser.add_argument("--num_workers", type=int, default=None, help="Number of parallel workers. Defaults to number of CPU cores.")
-    args = parser.parse_args()
-
+def parse_fpocket_info(info_file_path):
+    """
+    Parses the _info.txt file generated by fpocket to extract descriptors
+    for all found pockets.
+    """
+    descriptors = []
     try:
-        pdb_df = pd.read_csv(args.metadata_file)
-        if 'pdb_id' in pdb_df.columns:
-            pdb_ids = pdb_df['pdb_id'].unique().tolist()
-        elif 'run_name' in pdb_df.columns:
-            pdb_df['pdb_id'] = pdb_df['run_name'].apply(lambda x: x.split('-seed')[0])
-            pdb_ids = pdb_df['pdb_id'].unique().tolist()
-        else:
-            print(f"Error: Input file must contain either a 'pdb_id' or 'run_name' column.")
-            return
+        with open(info_file_path, 'r') as f:
+            content = f.read()
     except FileNotFoundError:
-        print(f"Error: Input file not found at '{args.metadata_file}'")
+        return None
+
+    pocket_blocks = content.split('Pocket')[1:]
+    
+    for i, block in enumerate(pocket_blocks):
+        pocket_info = {'Pocket Number': i + 1}
+        lines = block.strip().split('\n')
+        for line in lines:
+            if ':' in line:
+                key, value = line.split(':', 1)
+                key = key.strip()
+                try:
+                    pocket_info[key] = float(value.strip())
+                except ValueError:
+                    pocket_info[key] = value.strip()
+        descriptors.append(pocket_info)
+        
+    return pd.DataFrame(descriptors) if descriptors else None
+
+
+def run_fpocket(pdb_file_path, timeout):
+    """
+    Checks for a cached result first. If not found, runs fpocket.
+    Includes a timeout and robust path handling.
+    """
+    pdb_id = os.path.basename(pdb_file_path).replace('.pdb', '')
+    pdb_dir = os.path.dirname(pdb_file_path)
+    
+    fpocket_main_out_dir = os.path.join(pdb_dir, f"{pdb_id}_out")
+    info_file = os.path.join(fpocket_main_out_dir, f"{pdb_id}_info.txt")
+
+    # --- NEW CACHING LOGIC ---
+    # If the final output file already exists, parse and return it immediately.
+    if os.path.exists(info_file):
+        return parse_fpocket_info(info_file), "Used cached result."
+
+    # --- If not cached, run fpocket ---
+    command = ["fpocket", "-f", pdb_file_path]
+    
+    try:
+        subprocess.run(command, check=True, cwd=pdb_dir, capture_output=True, text=True, timeout=timeout)
+        
+        if os.path.exists(info_file):
+            return parse_fpocket_info(info_file), None
+        else:
+            return None, f"Info: fpocket ran on {pdb_id} but did not create an info file."
+            
+    except FileNotFoundError:
+        return None, "FATAL ERROR: 'fpocket' command not found. Please ensure it is in your PATH."
+
+    except subprocess.TimeoutExpired:
+        return None, f"TIMEOUT: fpocket took longer than {timeout}s to process {pdb_id}."
+        
+    except subprocess.CalledProcessError as e:
+        return None, f"ERROR: fpocket failed to process {pdb_id} with exit code {e.returncode}.\nfpocket STDERR:\n{e.stderr}\n"
+
+def process_pdb_id(pdb_id, args):
+    """
+    Worker function for the parallel loop. Downloads a PDB and runs fpocket.
+    """
+    pdb_file_path, error = download_pdb_if_missing(pdb_id, args.pdb_cache_dir)
+    if error:
+        tqdm.write(error)
+        return None
+
+    if pdb_file_path:
+        absolute_pdb_path = os.path.abspath(pdb_file_path)
+        desc_df, message = run_fpocket(absolute_pdb_path, timeout=args.fpocket_timeout)
+        
+        # Log messages for skipped/errored files, but not for successful cache hits
+        if message and "Used cached result" not in message:
+            tqdm.write(message)
+        
+        if desc_df is not None and not desc_df.empty:
+            desc_df['normalized_pdb_id'] = pdb_id
+            return desc_df
+    return None
+
+def main(args):
+    print("--- Generating Pocket Descriptors for Mutant Targets ---")
+
+    # --- 1. Load Metadata and Find Unique, Normalized PDBs ---
+    print(f"Loading metadata from: {args.input_metadata}")
+    df = pd.read_parquet(args.input_metadata) if args.input_metadata.endswith('.parquet') else pd.read_csv(args.input_metadata)
+
+    if 'pdb_id' not in df.columns:
+        raise ValueError("'pdb_id' column not found in metadata file.")
+
+    print("Parsing and expanding comma-separated PDB ID entries...")
+    df_expanded = df.assign(pdb_id=df['pdb_id'].str.split(',')).explode('pdb_id')
+    df_expanded['normalized_pdb_id'] = df_expanded['pdb_id'].apply(normalize_pdb_id)
+    
+    unique_pdb_ids = df_expanded['normalized_pdb_id'].dropna().unique()
+    print(f"Found {len(unique_pdb_ids)} unique, normalized PDB IDs to process.")
+
+    # --- 2. Download PDBs and Run fpocket Analysis in Parallel ---
+    os.makedirs(args.pdb_cache_dir, exist_ok=True)
+    all_descriptor_dfs = []
+    
+    with ProcessPoolExecutor(max_workers=args.num_workers) as executor:
+        future_to_pdb = {executor.submit(process_pdb_id, pdb_id, args): pdb_id for pdb_id in unique_pdb_ids}
+        
+        for future in tqdm(as_completed(future_to_pdb), total=len(unique_pdb_ids), desc="Analyzing Pockets"):
+            result = future.result()
+            if result is not None:
+                all_descriptor_dfs.append(result)
+
+    # --- 3. Aggregate and Save Final Descriptors ---
+    if not all_descriptor_dfs:
+        print("Error: No pocket descriptors were generated.")
         return
 
-    tasks = []
-    for pdb_id in pdb_ids:
-        pdb_id_lower = pdb_id.lower()
-        possible_paths = [
-            os.path.join(args.pdb_cache_dir, f"{pdb_id_lower}.pdb"),
-            os.path.join(args.pdb_cache_dir, f"pdb{pdb_id_lower}.ent")
-        ]
-        pdb_path = next((path for path in possible_paths if os.path.exists(path)), None)
-        if pdb_path:
-            tasks.append((pdb_path, pdb_id))
-        else:
-            logging.warning(f"[{pdb_id}] PDB file not found in cache. Skipping.")
-
-    print(f"Found {len(tasks)} valid PDB files to process with fpocket.")
-    results = []
+    final_descriptors_df = pd.concat(all_descriptor_dfs, ignore_index=True)
     
-    with concurrent.futures.ProcessPoolExecutor(max_workers=args.num_workers) as executor:
-        future_to_task = {executor.submit(run_and_parse_fpocket, task[0], task[1]): task for task in tasks}
-        
-        for future in tqdm(concurrent.futures.as_completed(future_to_task), total=len(tasks), desc="Processing with fpocket"):
-            result = future.result()
-            if result:
-                results.append(result)
+    pdb_to_uniprot_map = df_expanded.groupby('normalized_pdb_id')['uniprot_id'].first()
+    final_descriptors_df['uniprot_id'] = final_descriptors_df['normalized_pdb_id'].map(pdb_to_uniprot_map)
+    final_descriptors_df.dropna(subset=['uniprot_id'], inplace=True)
 
-    if results:
-        output_df = pd.DataFrame(results)
-        output_df.dropna(how='all', subset=[col for col in output_df.columns if col != 'pdb_id'], inplace=True)
-        output_df.to_csv(args.output_file, index=False)
-        print(f"\nSuccessfully characterized pockets for {len(output_df)} PDB IDs.")
-        print(f"Results saved to: {args.output_file}")
+    final_descriptors_df = final_descriptors_df.copy()
+
+    if 'Score' in final_descriptors_df.columns:
+        idx = final_descriptors_df.groupby(['normalized_pdb_id'])['Score'].idxmax()
     else:
-        print("\nCould not characterize any pockets with fpocket. Check the log messages above for details.")
+        tqdm.write("Warning: 'Score' column not found. Falling back to 'Volume' to select best pocket.")
+        if 'Volume' not in final_descriptors_df.columns:
+            raise ValueError("'Score' and 'Volume' not found in fpocket descriptors.")
+        idx = final_descriptors_df.groupby(['normalized_pdb_id'])['Volume'].idxmax()
+        
+    largest_pockets_df = final_descriptors_df.loc[idx]
+    
+    print("\nAggregating descriptors using mean and standard deviation...")
+    # Convert numeric columns index to a list for robustness
+    numeric_cols = list(largest_pockets_df.select_dtypes(include=np.number).columns.drop(['Pocket Number'], errors='ignore'))
+    agg_df = largest_pockets_df.groupby('uniprot_id')[numeric_cols].agg(['mean', 'std'])
+    
+    # Flatten the multi-level column names (e.g., ('Volume', 'mean') -> 'Volume_mean')
+    agg_df.columns = ['_'.join(col).strip() for col in agg_df.columns.values]
+    
+    print(f"\nAggregated descriptors for {len(agg_df)} UniProt IDs.")
+    print(f"Saving final pocket descriptors to: {args.output_path}")
+    agg_df.dropna(subset=[c + '_mean' for c in numeric_cols]).to_csv(args.output_path)
+    print("--- Done ---")
 
-if __name__ == "__main__":
-    main()
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description="Generate fpocket descriptors from a metadata file in parallel.")
+    parser.add_argument('--input_metadata', type=str, required=True, help='Path to the input metadata file (.parquet or .csv) with a `pdb_id` column.')
+    parser.add_argument('--output_path', type=str, default='mutant_fpocket_descriptors.csv', help='Path to save the final aggregated pocket descriptors.')
+    parser.add_argument('--pdb_cache_dir', type=str, default='./pdb_cache', help='Directory to store downloaded PDB files.')
+    parser.add_argument('--num_workers', type=int, default=os.cpu_count(), help='Number of parallel processes to use for analysis.')
+    parser.add_argument('--fpocket_timeout', type=int, default=120, help='Timeout in seconds for a single fpocket run.')
+    # Legacy argument, no longer used by the core logic but kept for compatibility
+    parser.add_argument('--fpocket_output_dir', type=str, default='./fpocket_output', help='(Legacy) Not used.')
+    
+    args = parser.parse_args()
+    main(args)
+
+
