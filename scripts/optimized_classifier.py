@@ -296,6 +296,35 @@ def main(args):
 
     print("✅ In-memory data preparation complete.")
 
+    # =============================================================================
+    # --- Phase 1.25: Project Unique Feature Tables (Final Version) ---
+    # =============================================================================
+    from sklearn.random_projection import SparseRandomProjection
+
+    print(f"\n--- Projecting unique feature tables ---")
+
+    n_components = 2048 # This is now the final number of features for the model
+    n_ligand_features = smiles_embeddings.shape[1]
+    n_protein_features = protein_embeddings.shape[1]
+    n_total_features = n_ligand_features + n_protein_features
+
+    # 1. Initialize the projector to create the random matrix `R`
+    projector = SparseRandomProjection(n_components=n_components, random_state=args.random_seed).fit(np.zeros((1, n_total_features)))
+    random_matrix = projector.components_.T.toarray()
+
+    # 2. Split `R` into ligand and protein parts
+    R_ligand = random_matrix[:n_ligand_features, :]
+    R_protein = random_matrix[n_ligand_features:, :]
+
+    # 3. Pre-compute the new, low-dimensional unique feature tables
+    unique_ligands_projected = smiles_embeddings @ R_ligand
+    unique_proteins_projected = protein_embeddings @ R_protein
+
+    # Clear the original large arrays from memory
+    del smiles_embeddings, protein_embeddings, random_matrix, R_ligand, R_protein
+
+    print(f"✅ Unique features projected to {n_components} dimensions.")
+
     # --- JAX Setup ---
     key = jax.random.PRNGKey(args.random_seed)
     
@@ -309,12 +338,15 @@ def main(args):
 
     # --- Phase 1: Load all data to JAX device ---
     print("\n--- Loading all data to JAX device ---")
-    unique_ligands = jax.device_put(smiles_embeddings)
-    unique_proteins = jax.device_put(protein_embeddings)
-
+    
+    unique_ligands = jax.device_put(unique_ligands_projected)
+    unique_proteins = jax.device_put(unique_proteins_projected)
+    
+    # The index and label arrays are loaded as before
     train_ligand_indices = jax.device_put(train_ligand_indices)
     train_protein_indices = jax.device_put(train_protein_indices)
     train_labels = jax.device_put(y_train)
+
     print("✅ Training data loaded to JAX device.")
 
     # --- Phase 1.5: Fit a Standard Scaler (Mean/Std Dev) on-device ---
@@ -351,6 +383,35 @@ def main(args):
     scaler_params['mean'].block_until_ready()
     print("✅ Standard scaler fitted on-device.")
 
+#     # =============================================================================
+#     # --- Phase 1.75: Feature Selection based on Standard Deviation ---
+#     # =============================================================================
+#     print("\n--- Performing feature selection based on Standard Deviation ---")
+# 
+#     # The 'scale' key from scaler_finalize holds the standard deviation vector
+#     std_dev_vec = scaler_params['scale']
+#     good_features_mask = std_dev_vec > 1e-6
+# 
+#     # Filter the main feature tables
+#     n_ligand_features = unique_ligands.shape[1]
+#     ligand_mask = good_features_mask[:n_ligand_features]
+#     protein_mask = good_features_mask[n_ligand_features:]
+# 
+#     unique_ligands = unique_ligands[:, ligand_mask]
+#     unique_proteins = unique_proteins[:, protein_mask]
+# 
+#     # Filter the scaler's parameters to match the new feature set
+#     scaler_params = {
+#         'mean': scaler_params['mean'][good_features_mask],
+#         'scale': scaler_params['scale'][good_features_mask]
+#     }
+# 
+#     # Update the total number of features
+#     n_features_old = n_features
+#     n_features = unique_ligands.shape[1] + unique_proteins.shape[1]
+# 
+#     print(f"✅ Feature selection complete. Kept {n_features} / {n_features_old} features.")
+# 
     # --- Phase 3: Initialize Model State ---
     params = {'w': jnp.zeros((1, n_features)), 'b': jnp.zeros(1)}
     opt_state = optimizer.init(params)
@@ -451,7 +512,7 @@ if __name__ == '__main__':
     parser.add_argument('--predict_batch_size', type=int, default=32, help="Batch size for inference.")
     # Model args
     parser.add_argument('--learning_rate', type=float, default=1e-5, help="Learning rate")
-    parser.add_argument('--alpha', type=float, default=1e-4, help="Regularization strength (like in sklearn).")
+    parser.add_argument('--alpha', type=float, default=1e-6, help="Regularization strength (like in sklearn).")
     parser.add_argument('--l1_ratio', type=float, default=0.15, help="Elastic Net mixing parameter (0=L2, 1=L1).")
     # Training loop args
     parser.add_argument('--epochs', type=int, default=5)
