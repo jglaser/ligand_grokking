@@ -393,32 +393,45 @@ def main(args):
         print(f"Epoch {epoch + 1}/{args.epochs} complete in {duration:.2f}s. Effective speed: {it_per_sec:,.0f} it/s")
 
     # --- Phase 5: Evaluation ---
+    print("\n--- Evaluating Model ---")
+    final_params, _ = state 
+
+    predictions = predict_probas_batched(
+        final_params,
+        scaler_params,
+        train_ligand_indices,
+        train_protein_indices,
+        unique_ligands,
+        unique_proteins,
+        batch_size=args.predict_batch_size
+    )
+    predictions.block_until_ready()
+
+    # The y_test array is already a standard NumPy array and can be used directly for scoring.
+    score = roc_auc_score(y_train, np.asarray(predictions))
+
+    print("\n--- Results ---")
+    print(f"Train Set ROC AUC Score: {score:.4f}")
+
     if test_df is not None:
-        print("\n--- Evaluating Model ---")
-        
         # --- Load test data from in-memory arrays to the JAX device ---
         # The NumPy arrays (y_test, test_ligand_indices, etc.) were created in Phase 0.
         test_ligand_indices_jax = jax.device_put(test_ligand_indices)
         test_protein_indices_jax = jax.device_put(test_protein_indices)
-        
-        final_params, _ = state 
-        
         predictions = predict_probas_batched(
-            final_params, 
+            final_params,
             scaler_params,
             test_ligand_indices_jax, # Use the JAX device array
             test_protein_indices_jax, # Use the JAX device array
-            unique_ligands, 
-            unique_proteins, 
+            unique_ligands,
+            unique_proteins,
             batch_size=args.predict_batch_size
         )
-        
         predictions.block_until_ready()
 
         # The y_test array is already a standard NumPy array and can be used directly for scoring.
         score = roc_auc_score(y_test, np.asarray(predictions))
-        
-        print("\n--- Results ---")
+
         print(f"Test Set ROC AUC Score: {score:.4f}")
 
     total_time = time.time() - start_time
