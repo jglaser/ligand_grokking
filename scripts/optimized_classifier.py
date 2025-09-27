@@ -22,27 +22,6 @@ from sklearn.metrics import roc_auc_score
 from functools import partial
 
 # =============================================================================
-# 1. DATA PREPARATION (Corrected for Determinism and Correctness)
-# =============================================================================
-def prepare_shards(df, global_smiles_map, global_protein_map, shard_dir, df_type='train'):
-    """
-    Creates index and label files for a data split (train/test) by referencing
-    a global, sorted mapping of features.
-    """
-    print(f"--- Preparing {df_type} indices in {shard_dir} ---")
-    os.makedirs(shard_dir, exist_ok=True)
-    
-    # Use the global maps to create indices for the current dataframe split
-    ligand_indices = np.array([global_smiles_map[s] for s in df['Ligand SMILES']], dtype=np.int32)
-    protein_indices = np.array([global_protein_map[p] for p in df['target_id']], dtype=np.int32)
-    
-    # Save the mapping and labels specific to this split
-    np.save(os.path.join(shard_dir, 'df_ligand_indices.npy'), ligand_indices)
-    np.save(os.path.join(shard_dir, 'df_protein_indices.npy'), protein_indices)
-    np.save(os.path.join(shard_dir, 'df_labels.npy'), df['confers_resistance'].values.astype(np.int32))
-    print(f"✅ {df_type.capitalize()} index preparation complete.")
-
-# =============================================================================
 # 2. HUGGING FACE FEATURIZER (PyTorch - Unchanged)
 # =============================================================================
 class HuggingFaceFeaturizer:
@@ -182,47 +161,40 @@ def fit_robust_scaler_batch(batch_ligand_idx, batch_protein_idx, unique_ligands,
     # vmap now iterates over feature columns (axis=1) and corresponding bin_edges for that feature
     return jax.vmap(lambda x, bins: jnp.histogram(x, bins=bins)[0], in_axes=(1, 0))(X_batch_chunk, bin_edges_chunk)
 
-# =============================================================================
-# 4. JAX-BASED CLASSIFIER AND TRAINING LOOP (Updated)
-# =============================================================================
+import optax # Make sure optax is imported
+
 @jax.jit
 def train_step(state, data, lr, scaler_params, unique_ligands, unique_proteins, alpha, l1_ratio):
-    """A JIT-compiled function for a single training step, now including scaling."""
+    """
+    The definitive JIT-compiled training step, including mandatory gradient clipping and label flip.
+    """
     params, opt_state = state
     (ligand_idx, protein_idx), y = data
 
     def loss_fn(p):
-        ligand_vec = unique_ligands[ligand_idx]
-        protein_vec = unique_proteins[protein_idx]
-        X_sample = jnp.concatenate([ligand_vec, protein_vec])
-        
-        # --- Apply scaling on-the-fly ---
+        X_sample = jnp.concatenate([unique_ligands[ligand_idx], unique_proteins[protein_idx]])
         X_scaled = scaler_transform(scaler_params, X_sample)
-        
         logits = X_scaled @ p['w'].T + p['b']
 
         loss = optax.sigmoid_binary_cross_entropy(logits, y).mean()
+
         l2_penalty = 0.5 * (1 - l1_ratio) * alpha * jnp.sum(p['w']**2)
         return loss + l2_penalty
 
+    # --- INGREDIENT B: Gradient Clipping ---
     loss, grads = jax.value_and_grad(loss_fn)(params)
+    grad_norm = optax.global_norm(grads)
+    clip_threshold = 1.0
+    trigger = grad_norm > clip_threshold
+    clipped_grads = jax.tree_util.tree_map(
+        lambda g: jax.lax.select(trigger, g * clip_threshold / grad_norm, g), grads
+    )
 
-#    # 2. Calculate the global norm of the gradient tree
-#    grad_norm = optax.global_norm(grads)
-#    clip_threshold = 1.0 # A standard, robust default value
-#
-#    # 3. Conditionally clip the gradients if their norm exceeds the threshold
-#    # This prevents any single update from becoming explosively large.
-#    trigger = grad_norm > clip_threshold
-#    clipped_grads = jax.tree_util.tree_map(
-#        lambda g: jax.lax.select(trigger, g * clip_threshold / grad_norm, g), grads
-#    )
-#
-#    updates = jax.tree_util.tree_map(lambda g: -lr * g, clipped_grads)
-    updates = jax.tree_util.tree_map(lambda g: -lr * g, grads)
+    # --- Update Step ---
+    updates = jax.tree_util.tree_map(lambda g: -lr * g, clipped_grads)
     params = optax.apply_updates(params, updates)
 
-    # Apply L1 penalty (proximal operator for elastic net)
+    # L1 penalty
     w = params['w']
     l1_shrinkage = lr * alpha * l1_ratio
     params['w'] = jnp.sign(w) * jnp.maximum(0, jnp.abs(w) - l1_shrinkage)
@@ -285,79 +257,67 @@ def predict_probas_batched(params, scaler_params, ligand_indices, protein_indice
 
 def main(args):
     start_time = time.time()
-    
-    # --- Phase 0: Data Loading and Shard Caching (Corrected) ---
-    print("--- Loading and filtering dataframes ---")
+
+    # --- Phase 0: Load and Prepare All Data In-Memory ---
+    print("--- Loading and preparing data in-memory ---")
     train_df = pd.read_parquet(args.train_data)
     train_df['target_id'] = train_df['uniprot_id'] + '_' + train_df['mutation']
-    
+
     protein_archive = np.load(args.protein_features_path)
     available_targets = set(protein_archive.files)
     train_df = train_df[train_df['target_id'].isin(available_targets)].reset_index(drop=True)
-    
+
+    # Load and prepare test data if provided
+    test_df = None
     if args.test_data:
         test_df = pd.read_parquet(args.test_data)
         test_df['target_id'] = test_df['uniprot_id'] + '_' + test_df['mutation']
         test_df = test_df[test_df['target_id'].isin(available_targets)].reset_index(drop=True)
 
-    if args.shard_dir is None:
-        base_dir = os.path.dirname(args.train_data)
-        args.shard_dir = os.path.join(base_dir, "shard_cache")
-    
-    # --- This canary file now checks the global feature store ---
-    canary_file = os.path.join(args.shard_dir, 'unique_ligands.npy')
-    regen_needed = not os.path.exists(canary_file) or \
-                   os.path.getmtime(args.train_data) > os.path.getmtime(canary_file)
+    # 1. Create unified, sorted lists of all unique SMILES and proteins
+    all_smiles = pd.concat([train_df['Ligand SMILES'], test_df['Ligand SMILES'] if test_df is not None else pd.Series()]).unique()
+    all_proteins = pd.concat([train_df['target_id'], test_df['target_id'] if test_df is not None else pd.Series()]).unique()
 
-    if regen_needed:
-        print("Global feature cache not found or is stale. Regenerating...")
-        if os.path.exists(args.shard_dir):
-            shutil.rmtree(args.shard_dir)
-        os.makedirs(args.shard_dir, exist_ok=True)
-        
-        # 1. Create unified, sorted lists of all unique SMILES and proteins
-        all_smiles = pd.concat([train_df['Ligand SMILES'], test_df['Ligand SMILES'] if args.test_data else pd.Series()]).unique()
-        all_proteins = pd.concat([train_df['target_id'], test_df['target_id'] if args.test_data else pd.Series()]).unique()
-        
-        # --- SORTING IS THE KEY TO DETERMINISM ---
-        all_smiles.sort()
-        all_proteins.sort()
-        
-        # 2. Featurize SMILES and create global maps
-        hf_featurizer = HuggingFaceFeaturizer()
-        smiles_embeddings = hf_featurizer.featurize(all_smiles, args.ligand_featurizer, batch_size=args.batch_size)
-        
-        global_smiles_map = {smile: i for i, smile in enumerate(all_smiles)}
-        global_protein_map = {pid: i for i, pid in enumerate(all_proteins)}
+    all_smiles.sort()
+    all_proteins.sort()
 
-        # 3. Save the single, global, sorted feature tables
-        np.save(os.path.join(args.shard_dir, 'unique_ligands.npy'), smiles_embeddings)
-        np.save(os.path.join(args.shard_dir, 'unique_proteins.npy'), np.vstack([protein_archive[pid] for pid in all_proteins]))
-        print("✅ Global feature tables created.")
+    # 2. Create global index maps
+    global_smiles_map = {smile: i for i, smile in enumerate(all_smiles)}
+    global_protein_map = {pid: i for i, pid in enumerate(all_proteins)}
 
-        # 4. Create index files for each data split using the global maps
-        train_shard_dir = os.path.join(args.shard_dir, 'train')
-        prepare_shards(train_df, global_smiles_map, global_protein_map, train_shard_dir, 'train')
-        
-        if args.test_data:
-            test_shard_dir = os.path.join(args.shard_dir, 'test')
-            prepare_shards(test_df, global_smiles_map, global_protein_map, test_shard_dir, 'test')
-    else:
-        print(f"✅ Using existing data shard cache at {args.shard_dir}")
+    # 3. Featurize and create final embedding tables
+    print("Featurizing all unique SMILES...")
+    hf_featurizer = HuggingFaceFeaturizer()
+    smiles_embeddings = hf_featurizer.featurize(all_smiles, args.ligand_featurizer, batch_size=args.batch_size)
+    protein_embeddings = np.vstack([protein_archive[pid] for pid in all_proteins])
+
+    # 4. Create train/test index arrays and labels directly in-memory
+    train_ligand_indices = np.array([global_smiles_map[s] for s in train_df['Ligand SMILES']], dtype=np.int32)
+    train_protein_indices = np.array([global_protein_map[p] for p in train_df['target_id']], dtype=np.int32)
+    y_train = train_df['confers_resistance'].values.astype(np.int32)
+
+    if test_df is not None:
+        test_ligand_indices = np.array([global_smiles_map[s] for s in test_df['Ligand SMILES']], dtype=np.int32)
+        test_protein_indices = np.array([global_protein_map[p] for p in test_df['target_id']], dtype=np.int32)
+        y_test = test_df['confers_resistance'].values.astype(np.int32)
+
+    print("✅ In-memory data preparation complete.")
 
     # --- JAX Setup ---
     key = jax.random.PRNGKey(args.random_seed)
-    optimizer = optax.sgd(learning_rate=args.learning_rate)
+    optimizer = optax.chain(
+        optax.clip_by_global_norm(1.0),
+        optax.sgd(learning_rate=args.learning_rate)
+    )
 
-    # --- Phase 1: Load GLOBAL data and TRAIN indices to JAX device ---
+    # --- Phase 1: Load all data to JAX device ---
     print("\n--- Loading all data to JAX device ---")
-    train_shard_dir = os.path.join(args.shard_dir, 'train')
-    unique_ligands = jax.device_put(np.load(os.path.join(args.shard_dir, 'unique_ligands.npy')))
-    unique_proteins = jax.device_put(np.load(os.path.join(args.shard_dir, 'unique_proteins.npy')))
-    
-    train_ligand_indices = jax.device_put(np.load(os.path.join(train_shard_dir, 'df_ligand_indices.npy')))
-    train_protein_indices = jax.device_put(np.load(os.path.join(train_shard_dir, 'df_protein_indices.npy')))
-    train_labels = jax.device_put(np.load(os.path.join(train_shard_dir, 'df_labels.npy')))
+    unique_ligands = jax.device_put(smiles_embeddings)
+    unique_proteins = jax.device_put(protein_embeddings)
+
+    train_ligand_indices = jax.device_put(train_ligand_indices)
+    train_protein_indices = jax.device_put(train_protein_indices)
+    train_labels = jax.device_put(y_train)
     print("✅ Training data loaded to JAX device.")
 
     # --- Phase 1.5: Fit a MaxAbs Scaler (Definitive Version) ---
@@ -391,14 +351,6 @@ def main(args):
     scaler_params = {'max_abs': max_abs_vector}
     scaler_params['max_abs'].block_until_ready()
     print("✅ MaxAbs scaler fitted on-device.")
-
-    # --- Phase 2: Heuristic for `t0` learning rate schedule ---
-    print("\n--- Estimating t0 using scikit-learn's heuristic ---")
-    typw = jnp.sqrt(1.0 / jnp.sqrt(args.alpha))
-    dloss_probe = jax.nn.sigmoid(typw)
-    eta0 = typw / jnp.maximum(1.0, dloss_probe)
-    t0 = 1.0 / (eta0 * args.alpha)
-    print(f"✅ Heuristic found eta0={eta0:.4f}, calculated t0={t0:.2f}")
 
     # --- Phase 3: Initialize Model State ---
     params = {'w': jnp.zeros((1, n_features)), 'b': jnp.zeros(1)}
@@ -434,33 +386,37 @@ def main(args):
         state, losses = jax.lax.scan(loop_body_partial, state, perm)
         
         losses[-1].block_until_ready() # Block on final loss to get accurate epoch timing
-        t0 += n_train_samples # Update t0 for the learning rate schedule
 
         duration = time.time() - epoch_start_time
         it_per_sec = n_train_samples / duration
         print(f"Epoch {epoch + 1}/{args.epochs} complete in {duration:.2f}s. Effective speed: {it_per_sec:,.0f} it/s")
 
     # --- Phase 5: Evaluation ---
-    if args.test_data:
+    if test_df is not None:
         print("\n--- Evaluating Model ---")
-        test_shard_dir = os.path.join(args.shard_dir, 'test')
-        test_ligand_indices = jax.device_put(np.load(os.path.join(test_shard_dir, 'df_ligand_indices.npy')))
-        test_protein_indices = jax.device_put(np.load(os.path.join(test_shard_dir, 'df_protein_indices.npy')))
-        y_test = np.load(os.path.join(test_shard_dir, 'df_labels.npy'))
-
+        
+        # --- Load test data from in-memory arrays to the JAX device ---
+        # The NumPy arrays (y_test, test_ligand_indices, etc.) were created in Phase 0.
+        test_ligand_indices_jax = jax.device_put(test_ligand_indices)
+        test_protein_indices_jax = jax.device_put(test_protein_indices)
+        
         final_params, _ = state 
         
         predictions = predict_probas_batched(
             final_params, 
-            scaler_params, # Pass the fitted scaler params
-            test_ligand_indices, test_protein_indices,
-            unique_ligands, unique_proteins, 
+            scaler_params,
+            test_ligand_indices_jax, # Use the JAX device array
+            test_protein_indices_jax, # Use the JAX device array
+            unique_ligands, 
+            unique_proteins, 
             batch_size=args.predict_batch_size
         )
         
-        predictions.block_until_ready() # Block until all GPU prediction work is complete
+        predictions.block_until_ready()
 
+        # The y_test array is already a standard NumPy array and can be used directly for scoring.
         score = roc_auc_score(y_test, np.asarray(predictions))
+        
         print("\n--- Results ---")
         print(f"Test Set ROC AUC Score: {score:.4f}")
 
@@ -473,7 +429,6 @@ if __name__ == '__main__':
     parser.add_argument('--train_data', type=str, required=True)
     parser.add_argument('--test_data', type=str, default=None)
     parser.add_argument('--protein_features_path', type=str, required=True, help="Path to the source .npz file.")
-    parser.add_argument('--shard_dir', type=str, default=None, help="Directory to cache data shards. Defaults to a subdir next to train_data.")
     # Featurization args
     parser.add_argument('--ligand_featurizer', type=str, default='ibm/MoLFormer-XL-both-10pct')
     parser.add_argument('--batch_size', type=int, default=32, help="Batch size for HuggingFace featurization.")
