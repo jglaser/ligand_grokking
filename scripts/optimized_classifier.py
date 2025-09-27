@@ -439,7 +439,7 @@ if __name__ == '__main__':
     # Featurization args
     parser.add_argument('--ligand_featurizer', type=str, default='ibm/MoLFormer-XL-both-10pct')
     parser.add_argument('--batch_size', type=int, default=32, help="Batch size for HuggingFace featurization.")
-    parser.add_argument('--fit_batch_size', type=int, default=4096, help="Batch size for fitting the JAX StandardScaler.")
+    parser.add_argument('--fit_batch_size', type=int, default=32, help="Batch size for fitting the JAX StandardScaler.")
 
     parser.add_argument('--predict_batch_size', type=int, default=32, help="Batch size for inference.")
     # Model args
