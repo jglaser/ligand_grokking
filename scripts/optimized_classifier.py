@@ -106,9 +106,9 @@ def scaler_finalize(scaler_state):
 
 @jax.jit
 def scaler_transform(scaler_params, X):
-    """Applies MaxAbs scaling with numerical stability."""
+    """Applies standard scaling (Z-score) with numerical stability."""
     epsilon = 1e-6
-    return X / (scaler_params['max_abs'] + epsilon)
+    return (X - scaler_params['mean']) / (scaler_params['scale'] + epsilon)
 
 def get_quantiles_from_hist(histograms, bin_edges_matrix, quantiles):
     """Calculates quantiles from histograms with per-feature bin edges."""
@@ -317,38 +317,39 @@ def main(args):
     train_labels = jax.device_put(y_train)
     print("✅ Training data loaded to JAX device.")
 
-    # --- Phase 1.5: Fit a MaxAbs Scaler (Definitive Version) ---
-    print("\n--- Fitting a MaxAbs Scaler on-device ---")
+    # --- Phase 1.5: Fit a Standard Scaler (Mean/Std Dev) on-device ---
+    print("\n--- Fitting a Standard Scaler (Mean/Std Dev) on-device ---")
     n_features = unique_ligands.shape[1] + unique_proteins.shape[1]
     n_train_samples = train_labels.shape[0]
     fit_batch_size = args.fit_batch_size
 
-    # --- Find the per-feature maximum absolute value ---
-    max_abs_vector = jnp.zeros((n_features,))
-
+    # This JIT-compiled function efficiently updates the scaler's statistics for one batch
     @jax.jit
-    def get_columnwise_max_abs_batch(batch_ligand_idx, batch_protein_idx, unique_ligands, unique_proteins):
-        """JIT-compiled function to get the column-wise max_abs of a feature batch."""
+    def fit_standard_scaler_batch(scaler_state, batch_ligand_idx, batch_protein_idx, unique_ligands, unique_proteins):
         X_batch = jnp.concatenate([
             unique_ligands[batch_ligand_idx],
             unique_proteins[batch_protein_idx]
         ], axis=1)
-        return jnp.max(jnp.abs(X_batch), axis=0)
+        # Use the Welford's algorithm implementation from the top of the file
+        return scaler_update(scaler_state, X_batch)
 
-    for i in tqdm(range(0, n_train_samples, fit_batch_size), desc="Finding Max Abs"):
+    # Initialize the scaler state (count=0, mean=0, M2=0)
+    scaler_state = scaler_init(n_features)
+
+    # Loop over the data in batches to compute the final statistics
+    for i in tqdm(range(0, n_train_samples, fit_batch_size), desc="Fitting Standard Scaler"):
         start_idx, end_idx = i, min(i + fit_batch_size, n_train_samples)
         batch_ligand_idx = train_ligand_indices[start_idx:end_idx]
         batch_protein_idx = train_protein_indices[start_idx:end_idx]
 
-        batch_max_abs_vec = get_columnwise_max_abs_batch(
-            batch_ligand_idx, batch_protein_idx, unique_ligands, unique_proteins
+        scaler_state = fit_standard_scaler_batch(
+            scaler_state, batch_ligand_idx, batch_protein_idx, unique_ligands, unique_proteins
         )
-        max_abs_vector = jnp.maximum(max_abs_vector, batch_max_abs_vec)
 
-    scaler_params = {'max_abs': max_abs_vector}
-    scaler_params['max_abs'].block_until_ready()
-    print("✅ MaxAbs scaler fitted on-device.")
-
+    # Finalize the calculation to get the mean and scale (std dev)
+    scaler_params = scaler_finalize(scaler_state)
+    scaler_params['mean'].block_until_ready()
+    print("✅ Standard scaler fitted on-device.")
 
     # --- Phase 3: Initialize Model State ---
     params = {'w': jnp.zeros((1, n_features)), 'b': jnp.zeros(1)}
@@ -436,7 +437,7 @@ if __name__ == '__main__':
 
     parser.add_argument('--predict_batch_size', type=int, default=32, help="Batch size for inference.")
     # Model args
-    parser.add_argument('--learning_rate', type=float, default=1e-4, help="Learning rate")
+    parser.add_argument('--learning_rate', type=float, default=1e-5, help="Learning rate")
     parser.add_argument('--alpha', type=float, default=1e-4, help="Regularization strength (like in sklearn).")
     parser.add_argument('--l1_ratio', type=float, default=0.15, help="Elastic Net mixing parameter (0=L2, 1=L1).")
     # Training loop args
