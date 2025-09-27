@@ -39,7 +39,7 @@ def prepare_shards(df, global_smiles_map, global_protein_map, shard_dir, df_type
     # Save the mapping and labels specific to this split
     np.save(os.path.join(shard_dir, 'df_ligand_indices.npy'), ligand_indices)
     np.save(os.path.join(shard_dir, 'df_protein_indices.npy'), protein_indices)
-    np.save(os.path.join(shard_dir, 'df_labels.npy'), df['is_effective_against_mutant'].values.astype(np.int32))
+    np.save(os.path.join(shard_dir, 'df_labels.npy'), df['confers_resistance'].values.astype(np.int32))
     print(f"✅ {df_type.capitalize()} index preparation complete.")
 
 # =============================================================================
@@ -126,20 +126,70 @@ def scaler_finalize(scaler_state):
     return {'mean': mean, 'scale': scale}
 
 @jax.jit
-def scaler_transform(final_scaler_state, X):
-    """Applies the Z-score scaling transformation."""
-    return (X - final_scaler_state['mean']) / final_scaler_state['scale']
+def scaler_transform(scaler_params, X):
+    """Applies MaxAbs scaling with numerical stability."""
+    epsilon = 1e-6
+    return X / (scaler_params['max_abs'] + epsilon)
+
+def get_quantiles_from_hist(histograms, bin_edges_matrix, quantiles):
+    """Calculates quantiles from histograms with per-feature bin edges."""
+    cdf = jnp.cumsum(histograms, axis=-1)
+    total_counts = cdf[..., -1]
+    
+    target_counts = total_counts[..., None] * quantiles[None, :] - 1e-6
+    
+    # Define a function for a single row to vmap
+    def find_indices(single_cdf, single_target_counts):
+        return jnp.searchsorted(single_cdf, single_target_counts)
+        
+    quantile_indices = jax.vmap(find_indices)(cdf, target_counts)
+    
+    # Interpolate to find the quantile value within the correct bins for each feature
+    bin_widths = (bin_edges_matrix[:, 1:] - bin_edges_matrix[:, :-1])
+    
+    # Gather the specific bin widths and starting edges for each quantile index
+    # This is an advanced indexing operation
+    relevant_bin_starts = jax.vmap(lambda x, y: x[y])(bin_edges_matrix, quantile_indices)
+    relevant_bin_widths = jax.vmap(lambda x, y: x[y])(bin_widths, quantile_indices)
+
+    return relevant_bin_starts + relevant_bin_widths / 2
+
+
+@jax.jit
+def get_columnwise_min_max_batch(batch_ligand_idx, batch_protein_idx, unique_ligands, unique_proteins):
+    """JIT-compiled function to get the column-wise min and max of a feature batch."""
+    X_batch = jnp.concatenate([
+        unique_ligands[batch_ligand_idx],
+        unique_proteins[batch_protein_idx]
+    ], axis=1)
+    return jnp.min(X_batch, axis=0), jnp.max(X_batch, axis=0)
+
+
+@partial(jax.jit, static_argnames=['feature_chunk_size'])
+def fit_robust_scaler_batch(batch_ligand_idx, batch_protein_idx, unique_ligands, unique_proteins, 
+                            bin_edges_chunk, feature_start_idx, feature_chunk_size):
+    """
+    JIT-compiled function to assemble one batch, slice a chunk of features, 
+    and calculate histograms using per-feature bin edges.
+    """
+    X_batch = jnp.concatenate([
+        unique_ligands[batch_ligand_idx],
+        unique_proteins[batch_protein_idx]
+    ], axis=1)
+    
+    X_batch_chunk = jax.lax.dynamic_slice_in_dim(X_batch, feature_start_idx, feature_chunk_size, axis=1)
+    
+    # vmap now iterates over feature columns (axis=1) and corresponding bin_edges for that feature
+    return jax.vmap(lambda x, bins: jnp.histogram(x, bins=bins)[0], in_axes=(1, 0))(X_batch_chunk, bin_edges_chunk)
 
 # =============================================================================
 # 4. JAX-BASED CLASSIFIER AND TRAINING LOOP (Updated)
 # =============================================================================
 @jax.jit
-def train_step(state, data, t, scaler_params, unique_ligands, unique_proteins, alpha, l1_ratio):
+def train_step(state, data, lr, scaler_params, unique_ligands, unique_proteins, alpha, l1_ratio):
     """A JIT-compiled function for a single training step, now including scaling."""
     params, opt_state = state
     (ligand_idx, protein_idx), y = data
-
-    lr = 1.0 / (alpha * t)
 
     def loss_fn(p):
         ligand_vec = unique_ligands[ligand_idx]
@@ -150,11 +200,25 @@ def train_step(state, data, t, scaler_params, unique_ligands, unique_proteins, a
         X_scaled = scaler_transform(scaler_params, X_sample)
         
         logits = X_scaled @ p['w'].T + p['b']
+
         loss = optax.sigmoid_binary_cross_entropy(logits, y).mean()
         l2_penalty = 0.5 * (1 - l1_ratio) * alpha * jnp.sum(p['w']**2)
         return loss + l2_penalty
 
     loss, grads = jax.value_and_grad(loss_fn)(params)
+
+#    # 2. Calculate the global norm of the gradient tree
+#    grad_norm = optax.global_norm(grads)
+#    clip_threshold = 1.0 # A standard, robust default value
+#
+#    # 3. Conditionally clip the gradients if their norm exceeds the threshold
+#    # This prevents any single update from becoming explosively large.
+#    trigger = grad_norm > clip_threshold
+#    clipped_grads = jax.tree_util.tree_map(
+#        lambda g: jax.lax.select(trigger, g * clip_threshold / grad_norm, g), grads
+#    )
+#
+#    updates = jax.tree_util.tree_map(lambda g: -lr * g, clipped_grads)
     updates = jax.tree_util.tree_map(lambda g: -lr * g, grads)
     params = optax.apply_updates(params, updates)
 
@@ -218,31 +282,6 @@ def predict_probas_batched(params, scaler_params, ligand_indices, protein_indice
 # =============================================================================
 # 5. MAIN SCRIPT LOGIC (Updated & Corrected)
 # =============================================================================
-
-@partial(jax.jit, static_argnames=['fit_batch_size'])
-def _scaler_fit_step(i, scaler_state, unique_ligands, unique_proteins, train_ligand_indices, train_protein_indices, fit_batch_size):
-    """A single, JIT-compiled step for fitting the scaler."""
-    start_idx = i * fit_batch_size
-    batch_ligand_idx = jax.lax.dynamic_slice_in_dim(train_ligand_indices, start_idx, fit_batch_size, axis=0)
-    batch_protein_idx = jax.lax.dynamic_slice_in_dim(train_protein_indices, start_idx, fit_batch_size, axis=0)
-    
-    X_batch = jnp.concatenate([unique_ligands[batch_ligand_idx], unique_proteins[batch_protein_idx]], axis=1)
-    
-    return scaler_update(scaler_state, X_batch)
-
-@jax.jit
-def fit_scaler_batch(scaler_state, batch_ligand_idx, batch_protein_idx, unique_ligands, unique_proteins):
-    """
-    JIT-compiled function to assemble one batch of features on-device and update the scaler.
-    """
-    # Assemble the batch *inside* the JIT'd function using the provided indices
-    X_batch = jnp.concatenate([
-        unique_ligands[batch_ligand_idx],
-        unique_proteins[batch_protein_idx]
-    ], axis=1)
-
-    # Perform the scaler update on the assembled batch
-    return scaler_update(scaler_state, X_batch)
 
 def main(args):
     start_time = time.time()
@@ -308,7 +347,7 @@ def main(args):
 
     # --- JAX Setup ---
     key = jax.random.PRNGKey(args.random_seed)
-    optimizer = optax.sgd(learning_rate=1.0) 
+    optimizer = optax.sgd(learning_rate=args.learning_rate)
 
     # --- Phase 1: Load GLOBAL data and TRAIN indices to JAX device ---
     print("\n--- Loading all data to JAX device ---")
@@ -321,38 +360,37 @@ def main(args):
     train_labels = jax.device_put(np.load(os.path.join(train_shard_dir, 'df_labels.npy')))
     print("✅ Training data loaded to JAX device.")
 
-    # --- Phase 1.5: Fit the JAX StandardScaler (Corrected) ---
-    print("\n--- Fitting the JAX StandardScaler on training data ---")
+    # --- Phase 1.5: Fit a MaxAbs Scaler (Definitive Version) ---
+    print("\n--- Fitting a MaxAbs Scaler on-device ---")
     n_features = unique_ligands.shape[1] + unique_proteins.shape[1]
     n_train_samples = train_labels.shape[0]
     fit_batch_size = args.fit_batch_size
-    
-    scaler_state = scaler_init(n_features)
 
-    # <<< FIX: This loop now only prepares small index arrays.
-    # The expensive work is offloaded to the JIT-compiled `fit_scaler_batch` function.
-    for i in tqdm(range(0, n_train_samples, fit_batch_size), desc="Fitting Scaler"):
-        start_idx = i
-        end_idx = min(i + fit_batch_size, n_train_samples)
-        
-        # Prepare the small "call number" index arrays on the host
+    # --- Find the per-feature maximum absolute value ---
+    max_abs_vector = jnp.zeros((n_features,))
+
+    @jax.jit
+    def get_columnwise_max_abs_batch(batch_ligand_idx, batch_protein_idx, unique_ligands, unique_proteins):
+        """JIT-compiled function to get the column-wise max_abs of a feature batch."""
+        X_batch = jnp.concatenate([
+            unique_ligands[batch_ligand_idx],
+            unique_proteins[batch_protein_idx]
+        ], axis=1)
+        return jnp.max(jnp.abs(X_batch), axis=0)
+
+    for i in tqdm(range(0, n_train_samples, fit_batch_size), desc="Finding Max Abs"):
+        start_idx, end_idx = i, min(i + fit_batch_size, n_train_samples)
         batch_ligand_idx = train_ligand_indices[start_idx:end_idx]
         batch_protein_idx = train_protein_indices[start_idx:end_idx]
 
-        # Call the JIT function, passing the large tables and small indices.
-        # This correctly instructs the device to perform the lookup and update.
-        scaler_state = fit_scaler_batch(
-            scaler_state, 
-            batch_ligand_idx, 
-            batch_protein_idx, 
-            unique_ligands, 
-            unique_proteins
+        batch_max_abs_vec = get_columnwise_max_abs_batch(
+            batch_ligand_idx, batch_protein_idx, unique_ligands, unique_proteins
         )
+        max_abs_vector = jnp.maximum(max_abs_vector, batch_max_abs_vec)
 
-    # Finalize the scaler to get the mean and scale vectors for transformation
-    scaler_params = scaler_finalize(scaler_state)
-    scaler_params['mean'].block_until_ready() # Ensure all updates are complete
-    print("✅ Scaler fitted.")
+    scaler_params = {'max_abs': max_abs_vector}
+    scaler_params['max_abs'].block_until_ready()
+    print("✅ MaxAbs scaler fitted on-device.")
 
     # --- Phase 2: Heuristic for `t0` learning rate schedule ---
     print("\n--- Estimating t0 using scikit-learn's heuristic ---")
@@ -371,14 +409,14 @@ def main(args):
     print(f"\n--- Training Model on JAX ---")
 
     # Define the body of the training loop for one sample
-    def epoch_loop_body(state, idx_t, scaler_params, train_ligand_indices, train_protein_indices, train_labels, unique_ligands, unique_proteins, alpha, l1_ratio):
-        idx, t = idx_t
+    def epoch_loop_body(state, idx, lr, scaler_params, train_ligand_indices, train_protein_indices, train_labels, unique_ligands, unique_proteins, alpha, l1_ratio):
         data = ((train_ligand_indices[idx], train_protein_indices[idx]), train_labels[idx])
-        new_state, loss = train_step(state, data, t, scaler_params, unique_ligands, unique_proteins, alpha, l1_ratio)
+        new_state, loss = train_step(state, data, lr, scaler_params, unique_ligands, unique_proteins, alpha, l1_ratio)
         return new_state, loss
 
     # Create a partial function for the loop body with fixed arguments
     loop_body_partial = partial(epoch_loop_body,
+                                lr=args.learning_rate,
                                 scaler_params=scaler_params,
                                 train_ligand_indices=train_ligand_indices,
                                 train_protein_indices=train_protein_indices,
@@ -393,7 +431,7 @@ def main(args):
         perm = jax.random.permutation(subkey, n_train_samples)
 
         # Use jax.lax.scan for a fast, compiled training loop over one epoch
-        state, losses = jax.lax.scan(loop_body_partial, state, (perm, t0 + jnp.arange(n_train_samples)))
+        state, losses = jax.lax.scan(loop_body_partial, state, perm)
         
         losses[-1].block_until_ready() # Block on final loss to get accurate epoch timing
         t0 += n_train_samples # Update t0 for the learning rate schedule
@@ -443,6 +481,7 @@ if __name__ == '__main__':
 
     parser.add_argument('--predict_batch_size', type=int, default=32, help="Batch size for inference.")
     # Model args
+    parser.add_argument('--learning_rate', type=float, default=1e-5, help="Learning rate")
     parser.add_argument('--alpha', type=float, default=1e-4, help="Regularization strength (like in sklearn).")
     parser.add_argument('--l1_ratio', type=float, default=0.15, help="Elastic Net mixing parameter (0=L2, 1=L1).")
     # Training loop args

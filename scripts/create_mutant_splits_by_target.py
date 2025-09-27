@@ -23,7 +23,7 @@ def main(args):
     # y is the label we want to stratify on.
     # groups are the uniprot_ids that must not be split across train/test.
     X = mutant_df
-    y = mutant_df['is_effective_against_mutant']
+    y = mutant_df['confers_resistance']
     groups = mutant_df['uniprot_id'] 
 
     # --- 3. Create Splits using StratifiedGroupKFold ---
@@ -47,8 +47,8 @@ def main(args):
         # --- 4. Report and Save Splits ---
         print(f"  Train set size: {len(train_df)} ({train_df['uniprot_id'].nunique()} unique proteins)")
         print(f"  Test set size: {len(test_df)} ({test_df['uniprot_id'].nunique()} unique proteins)")
-        print(f"  Train class distribution:\n{train_df['is_effective_against_mutant'].value_counts(normalize=True).to_string()}")
-        print(f"  Test class distribution:\n{test_df['is_effective_against_mutant'].value_counts(normalize=True).to_string()}")
+        print(f"  Train class distribution:\n{train_df['confers_resistance'].value_counts(normalize=True).to_string()}")
+        print(f"  Test class distribution:\n{test_df['confers_resistance'].value_counts(normalize=True).to_string()}")
 
         # Verify that there is no overlap in protein uniprot_ids between train and test
         train_targets = set(train_df['uniprot_id'])
