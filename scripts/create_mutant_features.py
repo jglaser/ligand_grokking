@@ -74,8 +74,8 @@ def get_ensembl_gene_id(u_service, uniprot_id):
 
 def find_best_matching_transcript(e_service, gene_data, uniprot_seq, max_transcripts_to_check):
     """
-    Iterates through a prioritized subset of transcripts for a gene, aligns them
-    to the UniProt sequence, and returns the one with the best alignment score.
+    Iterates through transcripts and returns the one with the best alignment score
+    using a robust "glocal" alignment strategy.
     """
     transcripts = gene_data.get('Transcript', [])
     if not isinstance(transcripts, list) or not transcripts:
@@ -91,12 +91,20 @@ def find_best_matching_transcript(e_service, gene_data, uniprot_seq, max_transcr
     best_transcript = None
     best_score = -1
 
+    # --- FINAL ALIGNMENT STRATEGY: Use a "glocal" alignment ---
     aligner = PairwiseAligner()
-    aligner.mode = 'local'
+    # Use global alignment to consider the entire sequence
+    aligner.mode = 'global' 
+    # Do not penalize gaps at the ends of the sequences. This finds the best
+    # alignment of the UniProt sequence *within* the Ensembl transcript.
+    aligner.target_end_gap_score = 0.0
+    aligner.query_end_gap_score = 0.0
+    # Standard scoring for match/mismatch/gaps
     aligner.match_score = 5
     aligner.mismatch_score = -4
     aligner.open_gap_score = -10
     aligner.extend_gap_score = -1
+    # --- END ---
 
     for t in transcripts_to_check:
         transcript_id = t.get('id')
@@ -114,14 +122,17 @@ def find_best_matching_transcript(e_service, gene_data, uniprot_seq, max_transcr
 
         if isinstance(sequence, str):
             full_transcript_data['cdna'] = sequence
-            ensembl_protein_seq = "".join([CODON_TO_AA.get(sequence[i:i+3], '?') for i in range(0, len(sequence), 3)])
+            # Clean the translated sequence of any leading/trailing unknown codons
+            ensembl_protein_seq = "".join([CODON_TO_AA.get(sequence[i:i+3], '?') for i in range(0, len(sequence), 3)]).strip('?')
             
-            alignments = aligner.align(ensembl_protein_seq, uniprot_seq)
-            if len(alignments) > 0:
-                score = alignments[0].score
+            try:
+                # Find the best score for this transcript
+                score = aligner.score(ensembl_protein_seq, uniprot_seq)
                 if score > best_score:
                     best_score = score
                     best_transcript = full_transcript_data
+            except Exception:
+                continue
     
     # Heuristic: score should be at least 80% of a perfect match to be considered valid
     if best_score < 0.8 * len(uniprot_seq) * 5:
@@ -129,13 +140,10 @@ def find_best_matching_transcript(e_service, gene_data, uniprot_seq, max_transcr
 
     return best_transcript, None
 
-
 def get_variant_info(uniprot_protein_seq, transcript_data, mutation, gene_strand):
     """
-    Translates a protein mutation to a genomic variant, using a pre-aligned transcript.
-    
-    This version includes the definitive fix for handling the PairwiseAlignments iterator
-    and correctly parsing the alignment coordinates.
+    Translates a protein mutation to a genomic variant using a hybrid, 
+    context-first strategy to ensure alignment correctness.
     """
     try:
         match = re.match(r'([A-Z])(\d+)([A-Z])', mutation)
@@ -145,45 +153,67 @@ def get_variant_info(uniprot_protein_seq, transcript_data, mutation, gene_strand
 
         if 'cdna' not in transcript_data or 'Exon' not in transcript_data:
             return None, "Transcript data is missing 'cdna' or 'Exon' information."
- 
+
         cds = transcript_data['cdna']
         ensembl_protein_seq = "".join([CODON_TO_AA.get(cds[i:i+3], '?') for i in range(0, len(cds), 3)])
-        
+
         pos_idx = pos - 1
         if not (0 <= pos_idx < len(uniprot_protein_seq)):
             return None, f"Position {pos} is out of bounds for UniProt sequence."
-        
+
         if uniprot_protein_seq[pos_idx] != ref_aa:
             return None, f"Mutation reference '{ref_aa}' does not match UniProt sequence '{uniprot_protein_seq[pos_idx]}' at position {pos}."
- 
+
+        # --- HYBRID ALIGNMENT AND VERIFICATION ---
         aligner = PairwiseAligner()
-        aligner.mode = 'local'
+        aligner.mode = 'global'
+        aligner.target_end_gap_score = 0.0
+        aligner.query_end_gap_score = 0.0
         aligner.match_score = 5
         aligner.mismatch_score = -4
         aligner.open_gap_score = -10
         aligner.extend_gap_score = -1
         
-        # --- DEFINITIVE FIX: START ---
-        # The .align() method returns an iterator. We must iterate and take the first result.
-        alignments = aligner.align(ensembl_protein_seq, uniprot_protein_seq)
+        corrected_pos_idx = -1
+
+        # 1. First Pass: Use global alignment
         try:
-            first_alignment = next(alignments)
+            first_alignment = next(aligner.align(ensembl_protein_seq, uniprot_protein_seq))
+            ensembl_start = first_alignment.coordinates[0, 0]
+            uniprot_start = first_alignment.coordinates[1, 0]
+            offset = ensembl_start - uniprot_start
+            corrected_pos_idx = pos_idx + offset
         except StopIteration:
-            return None, "Alignment failed; no alignments were found."
+            return None, "Primary alignment failed."
 
-        # The .coordinates property gives the correctly parsed start/end indices.
-        # It's a 2xN numpy array: row 0 for ensembl, row 1 for uniprot.
-        ensembl_start = first_alignment.coordinates[0, 0]
-        uniprot_start = first_alignment.coordinates[1, 0]
-        offset = ensembl_start - uniprot_start
-        # --- DEFINITIVE FIX: END ---
+        # 2. Strong Verification: Check local context
+        window = 5
+        uniprot_context_start = max(0, pos_idx - window)
+        uniprot_context_end = min(len(uniprot_protein_seq), pos_idx + window + 1)
+        uniprot_context = uniprot_protein_seq[uniprot_context_start:uniprot_context_end]
+        
+        ensembl_context_start = max(0, corrected_pos_idx - window)
+        ensembl_context_end = min(len(ensembl_protein_seq), corrected_pos_idx + window + 1)
+        ensembl_context = ensembl_protein_seq[ensembl_context_start:ensembl_context_end]
 
-        corrected_pos = pos + offset
-        corrected_pos_idx = corrected_pos - 1
+        # 3. Fallback: If context mismatches, perform a direct search
+        if uniprot_context != ensembl_context:
+            try:
+                # Search for the exact context from UniProt within the Ensembl sequence
+                fallback_start_idx = ensembl_protein_seq.index(uniprot_context)
+                # If found, recalculate the corrected position based on this manual match
+                corrected_pos_idx = fallback_start_idx + (pos_idx - uniprot_context_start)
+            except ValueError:
+                # If the context is not found anywhere, the transcript is a bad match
+                tqdm.write(f"!! CRITICAL WARNING: Context mismatch for {mutation} in {transcript_data['id']}. Align and search failed.")
+                return None, "Alignment context mismatch and fallback search failed."
+        # --- END OF HYBRID STRATEGY ---
+        
+        corrected_pos = corrected_pos_idx + 1
 
         if not (0 <= corrected_pos_idx < len(ensembl_protein_seq)):
             return None, f"Position {pos} (corrected to {corrected_pos}) is out of bounds for Ensembl protein."
-
+        
         found_aa = ensembl_protein_seq[corrected_pos_idx]
         if found_aa != ref_aa:
             return None, f"Reference AA mismatch at aligned position {corrected_pos}. Expected {ref_aa}, but transcript has {found_aa}."
