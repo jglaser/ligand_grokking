@@ -106,9 +106,9 @@ def scaler_finalize(scaler_state):
 
 @jax.jit
 def scaler_transform(scaler_params, X):
-    """Applies MaxAbs scaling with numerical stability."""
+    """Applies standard scaling (Z-score) with numerical stability."""
     epsilon = 1e-6
-    return X / (scaler_params['max_abs'] + epsilon)
+    return (X - scaler_params['mean']) / (scaler_params['scale'] + epsilon)
 
 def get_quantiles_from_hist(histograms, bin_edges_matrix, quantiles):
     """Calculates quantiles from histograms with per-feature bin edges."""
@@ -163,42 +163,35 @@ def fit_robust_scaler_batch(batch_ligand_idx, batch_protein_idx, unique_ligands,
 
 import optax # Make sure optax is imported
 
-@jax.jit
-def train_step(state, data, lr, scaler_params, unique_ligands, unique_proteins, alpha, l1_ratio):
+@partial(jax.jit, static_argnames=['optimizer'])
+def train_step(state, data, learning_rate, scaler_params, unique_ligands, unique_proteins, alpha, l1_ratio, optimizer):
     """
-    The definitive JIT-compiled training step, including mandatory gradient clipping and label flip.
+    A definitive, JIT-compiled training step using a pure Optax implementation.
     """
     params, opt_state = state
     (ligand_idx, protein_idx), y = data
 
+    # The loss function is now simpler: it only computes the data loss.
+    # L2 penalty is handled by the optimizer's weight decay.
     def loss_fn(p):
         X_sample = jnp.concatenate([unique_ligands[ligand_idx], unique_proteins[protein_idx]])
         X_scaled = scaler_transform(scaler_params, X_sample)
         logits = X_scaled @ p['w'].T + p['b']
+        return optax.sigmoid_binary_cross_entropy(logits, y).mean()
 
-        loss = optax.sigmoid_binary_cross_entropy(logits, y).mean()
-
-        l2_penalty = 0.5 * (1 - l1_ratio) * alpha * jnp.sum(p['w']**2)
-        return loss + l2_penalty
-
-    # --- INGREDIENT B: Gradient Clipping ---
+    # Calculate loss and gradients on the data-only loss
     loss, grads = jax.value_and_grad(loss_fn)(params)
-    grad_norm = optax.global_norm(grads)
-    clip_threshold = 1.0
-    trigger = grad_norm > clip_threshold
-    clipped_grads = jax.tree_util.tree_map(
-        lambda g: jax.lax.select(trigger, g * clip_threshold / grad_norm, g), grads
-    )
 
-    # --- Update Step ---
-    updates = jax.tree_util.tree_map(lambda g: -lr * g, clipped_grads)
+    # Use the full optimizer chain (clipping, weight decay, adam) to get updates
+    updates, opt_state = optimizer.update(grads, opt_state, params)
     params = optax.apply_updates(params, updates)
 
-    # L1 penalty
-    w = params['w']
-    l1_shrinkage = lr * alpha * l1_ratio
-    params['w'] = jnp.sign(w) * jnp.maximum(0, jnp.abs(w) - l1_shrinkage)
+    # The L1 penalty is still applied separately as a proximal step
+    l1_shrinkage = learning_rate * alpha * l1_ratio
+    # Use a functional update style for the PyTree
+    params['w'] = jnp.sign(params['w']) * jnp.maximum(0, jnp.abs(params['w']) - l1_shrinkage)
 
+    # Return the newly updated optimizer state
     return (params, opt_state), loss
 
 @partial(jax.jit, static_argnames=['batch_size'])
@@ -305,9 +298,13 @@ def main(args):
 
     # --- JAX Setup ---
     key = jax.random.PRNGKey(args.random_seed)
+    
+    # Create a robust optimizer chain
+    # The L2 penalty (weight decay) is now handled directly by the optimizer
+    weight_decay = (1 - args.l1_ratio) * args.alpha
     optimizer = optax.chain(
         optax.clip_by_global_norm(1.0),
-        optax.sgd(learning_rate=args.learning_rate)
+        optax.adamw(learning_rate=args.learning_rate, weight_decay=weight_decay)
     )
 
     # --- Phase 1: Load all data to JAX device ---
@@ -320,37 +317,39 @@ def main(args):
     train_labels = jax.device_put(y_train)
     print("✅ Training data loaded to JAX device.")
 
-    # --- Phase 1.5: Fit a MaxAbs Scaler (Definitive Version) ---
-    print("\n--- Fitting a MaxAbs Scaler on-device ---")
+    # --- Phase 1.5: Fit a Standard Scaler (Mean/Std Dev) on-device ---
+    print("\n--- Fitting a Standard Scaler (Mean/Std Dev) on-device ---")
     n_features = unique_ligands.shape[1] + unique_proteins.shape[1]
     n_train_samples = train_labels.shape[0]
     fit_batch_size = args.fit_batch_size
 
-    # --- Find the per-feature maximum absolute value ---
-    max_abs_vector = jnp.zeros((n_features,))
-
+    # This JIT-compiled function efficiently updates the scaler's statistics for one batch
     @jax.jit
-    def get_columnwise_max_abs_batch(batch_ligand_idx, batch_protein_idx, unique_ligands, unique_proteins):
-        """JIT-compiled function to get the column-wise max_abs of a feature batch."""
+    def fit_standard_scaler_batch(scaler_state, batch_ligand_idx, batch_protein_idx, unique_ligands, unique_proteins):
         X_batch = jnp.concatenate([
             unique_ligands[batch_ligand_idx],
             unique_proteins[batch_protein_idx]
         ], axis=1)
-        return jnp.max(jnp.abs(X_batch), axis=0)
+        # Use the Welford's algorithm implementation from the top of the file
+        return scaler_update(scaler_state, X_batch)
 
-    for i in tqdm(range(0, n_train_samples, fit_batch_size), desc="Finding Max Abs"):
+    # Initialize the scaler state (count=0, mean=0, M2=0)
+    scaler_state = scaler_init(n_features)
+
+    # Loop over the data in batches to compute the final statistics
+    for i in tqdm(range(0, n_train_samples, fit_batch_size), desc="Fitting Standard Scaler"):
         start_idx, end_idx = i, min(i + fit_batch_size, n_train_samples)
         batch_ligand_idx = train_ligand_indices[start_idx:end_idx]
         batch_protein_idx = train_protein_indices[start_idx:end_idx]
 
-        batch_max_abs_vec = get_columnwise_max_abs_batch(
-            batch_ligand_idx, batch_protein_idx, unique_ligands, unique_proteins
+        scaler_state = fit_standard_scaler_batch(
+            scaler_state, batch_ligand_idx, batch_protein_idx, unique_ligands, unique_proteins
         )
-        max_abs_vector = jnp.maximum(max_abs_vector, batch_max_abs_vec)
 
-    scaler_params = {'max_abs': max_abs_vector}
-    scaler_params['max_abs'].block_until_ready()
-    print("✅ MaxAbs scaler fitted on-device.")
+    # Finalize the calculation to get the mean and scale (std dev)
+    scaler_params = scaler_finalize(scaler_state)
+    scaler_params['mean'].block_until_ready()
+    print("✅ Standard scaler fitted on-device.")
 
     # --- Phase 3: Initialize Model State ---
     params = {'w': jnp.zeros((1, n_features)), 'b': jnp.zeros(1)}
@@ -361,9 +360,10 @@ def main(args):
     print(f"\n--- Training Model on JAX ---")
 
     # Define the body of the training loop for one sample
-    def epoch_loop_body(state, idx, lr, scaler_params, train_ligand_indices, train_protein_indices, train_labels, unique_ligands, unique_proteins, alpha, l1_ratio):
+    def epoch_loop_body(state, idx, lr, scaler_params, train_ligand_indices, train_protein_indices, train_labels, unique_ligands, unique_proteins, alpha, l1_ratio,
+                        optimizer):
         data = ((train_ligand_indices[idx], train_protein_indices[idx]), train_labels[idx])
-        new_state, loss = train_step(state, data, lr, scaler_params, unique_ligands, unique_proteins, alpha, l1_ratio)
+        new_state, loss = train_step(state, data, lr, scaler_params, unique_ligands, unique_proteins, alpha, l1_ratio, optimizer)
         return new_state, loss
 
     # Create a partial function for the loop body with fixed arguments
@@ -375,7 +375,8 @@ def main(args):
                                 train_labels=train_labels,
                                 unique_ligands=unique_ligands,
                                 unique_proteins=unique_proteins,
-                                alpha=args.alpha, l1_ratio=args.l1_ratio)
+                                alpha=args.alpha, l1_ratio=args.l1_ratio,
+                                optimizer=optimizer)
 
     for epoch in range(args.epochs):
         epoch_start_time = time.time()
