@@ -8,7 +8,8 @@ Workflow:
 3.  For each protein, it finds the best-matching Ensembl transcript by aligning
     against the UniProt sequence.
 4.  For each mutation, it uses this best-match transcript to determine the precise
-    genomic location and the required nucleotide change.
+    genomic location and the required nucleotide change(s). It now correctly
+    handles both single (SNV) and multi-nucleotide (MNV) variants.
 5.  It makes a single, efficient call to `ag_model_client.predict_variant()`.
 6.  It creates the final "delta vector" (mutant - wild_type).
 """
@@ -131,7 +132,10 @@ def find_best_matching_transcript(e_service, gene_data, uniprot_seq, max_transcr
 
 def get_variant_info(uniprot_protein_seq, transcript_data, mutation, gene_strand):
     """
-    Translates a protein mutation to a genomic variant, using a pre-aligned transcript.
+    Translates a protein mutation to a genomic variant.
+    
+    This version correctly handles both single nucleotide variants (SNVs) and
+    multi-nucleotide variants (MNVs) that arise from a codon change.
     """
     try:
         match = re.match(r'([A-Z])(\d+)([A-Z])', mutation)
@@ -152,7 +156,6 @@ def get_variant_info(uniprot_protein_seq, transcript_data, mutation, gene_strand
         if uniprot_protein_seq[pos_idx] != ref_aa:
             return None, f"Mutation reference '{ref_aa}' does not match UniProt sequence '{uniprot_protein_seq[pos_idx]}' at position {pos}."
  
-        # --- FIX: Correctly access the start coordinate from the alignment tuple ---
         aligner = PairwiseAligner()
         aligner.mode = 'local'
         aligner.match_score = 5
@@ -160,9 +163,8 @@ def get_variant_info(uniprot_protein_seq, transcript_data, mutation, gene_strand
         aligner.open_gap_score = -10
         aligner.extend_gap_score = -1
         alignments = aligner.align(ensembl_protein_seq, uniprot_protein_seq)
-        if len(alignments) == 0: return None, "Alignment failed."
+        if not alignments: return None, "Alignment failed."
 
-  
         offset = alignments[0].aligned[0][0][0]
         corrected_pos = pos + offset
         corrected_pos_idx = corrected_pos - 1
@@ -179,28 +181,44 @@ def get_variant_info(uniprot_protein_seq, transcript_data, mutation, gene_strand
 
         new_codon = CODON_TABLE.get(alt_aa, [None])[0]
         if new_codon is None: return None, f"Invalid alternate amino acid '{alt_aa}'."
-        
-        diff_idx = next((i for i, (c1, c2) in enumerate(zip(original_codon, new_codon)) if c1 != c2), -1)
-        if diff_idx == -1: return None, "Mutation is synonymous (no nucleotide change)."
+        if original_codon == new_codon: return None, "Mutation is synonymous (no nucleotide change)."
 
-        cds_exons = sorted(transcript_data['Exon'], key=lambda x: x['start'])
+        # --- MODIFIED LOGIC: START ---
+        # Determine if the change is an SNV or MNV
+        diffs = [i for i, (c1, c2) in enumerate(zip(original_codon, new_codon)) if c1 != c2]
         
+        if len(diffs) == 1:
+            # It's a single nucleotide variant (SNV)
+            diff_idx = diffs[0]
+            ref_bases = original_codon[diff_idx]
+            alt_bases = new_codon[diff_idx]
+            cds_pos_of_mutation = codon_start_in_cds + diff_idx
+        else:
+            # It's a multi-nucleotide variant (MNV) spanning the codon
+            ref_bases = original_codon
+            alt_bases = new_codon
+            cds_pos_of_mutation = codon_start_in_cds  # Position is the start of the codon
+        # --- MODIFIED LOGIC: END ---
+        
+        cds_exons = sorted(transcript_data['Exon'], key=lambda x: x['start'])
         genomic_pos_of_mutation = -1
-        if gene_strand == 1:
+        
+        if gene_strand == 1: # Positive strand
             bases_covered = 0
             for exon in cds_exons:
                 exon_len = exon['end'] - exon['start'] + 1
-                if bases_covered + exon_len > codon_start_in_cds + diff_idx:
-                    offset_in_exon = (codon_start_in_cds + diff_idx) - bases_covered
+                if bases_covered + exon_len > cds_pos_of_mutation:
+                    offset_in_exon = cds_pos_of_mutation - bases_covered
                     genomic_pos_of_mutation = exon['start'] + offset_in_exon
                     break
                 bases_covered += exon_len
         else: # Negative strand
             bases_covered = 0
-            for exon in sorted(transcript_data['Exon'], key=lambda x: x['start'], reverse=True):
+            # For negative strand, cDNA is read from higher to lower genomic coords
+            for exon in sorted(cds_exons, key=lambda x: x['start'], reverse=True):
                 exon_len = exon['end'] - exon['start'] + 1
-                if bases_covered + exon_len > codon_start_in_cds + diff_idx:
-                    offset_in_exon = (codon_start_in_cds + diff_idx) - bases_covered
+                if bases_covered + exon_len > cds_pos_of_mutation:
+                    offset_in_exon = cds_pos_of_mutation - bases_covered
                     genomic_pos_of_mutation = exon['end'] - offset_in_exon
                     break
                 bases_covered += exon_len
@@ -210,12 +228,11 @@ def get_variant_info(uniprot_protein_seq, transcript_data, mutation, gene_strand
         
         result = {
             "position": genomic_pos_of_mutation,
-            "reference_bases": original_codon[diff_idx],
-            "alternate_bases": new_codon[diff_idx]
+            "reference_bases": ref_bases,
+            "alternate_bases": alt_bases
         }
         return result, None
     except Exception as e:
-        # Catch any unexpected errors during this complex process and report them
         return None, f"An unexpected exception occurred during variant mapping: {e} (Line: {e.__traceback__.tb_lineno})"
 
 
@@ -233,7 +250,6 @@ def process_uniprot_id(uniprot_id, uniprot_to_mutations, max_transcripts_to_chec
     Worker function to process a single UniProt ID.
     Initializes its own API clients to be process-safe.
     """
-    # Each worker process must have its own API clients
     u_service = UniProt()
     e_service = Ensembl()
     ag_model_client = dna_client.create(api_key)
@@ -253,7 +269,6 @@ def process_uniprot_id(uniprot_id, uniprot_to_mutations, max_transcripts_to_chec
 
         transcript, reason = find_best_matching_transcript(e_service, gene_data, uniprot_seq, max_transcripts_to_check)
         if not transcript:
-            # tqdm.write is not process-safe, so we return the error to be printed in the main thread
             return f"Warning: Could not find a suitable transcript for {uniprot_id}. Reason: {reason}"
 
         gene_center = (gene_data['start'] + gene_data['end']) // 2
@@ -264,7 +279,7 @@ def process_uniprot_id(uniprot_id, uniprot_to_mutations, max_transcripts_to_chec
         mutations = uniprot_to_mutations.get(uniprot_id, [])
 
         if feature_type == 'randomized_delta':
-            rng = np.random.default_rng(random_seed + pred_start) # a unique seed for every WT sequence
+            rng = np.random.default_rng(random_seed + pred_start)
             shuffled_mutations = rng.choice(mutations, size=len(mutations), replace=False)
         else:
             shuffled_mutations = mutations
@@ -272,42 +287,52 @@ def process_uniprot_id(uniprot_id, uniprot_to_mutations, max_transcripts_to_chec
         for mutation, mutation_label  in zip(mutations, shuffled_mutations):
             target_id = f"{uniprot_id}_{mutation_label}"
             variant_info, reason = get_variant_info(uniprot_seq, transcript, mutation, gene_data['strand'])
-            
+           
             if not variant_info:
                 tqdm.write(f"Warning: Could not map mutation {mutation} to genome for {uniprot_id}. Reason: {reason}")
                 continue
-            
-            variant = genome.Variant(
-                chromosome=chromosome, 
-                position=variant_info['position'],
-                reference_bases=variant_info['reference_bases'],
-                alternate_bases=variant_info['alternate_bases']
-            )
+            all_mutations = mutation.split(',')
 
-            variant_predictions = ag_model_client.predict_variant(
-                interval=interval, variant=variant,
-                requested_outputs=list(dna_client.OutputType),
-                ontology_terms=['EFO:0002067']
-            )
+            for point_mutation in all_mutations:
+                variant = genome.Variant(
+                    chromosome=chromosome, 
+                    position=variant_info['position'],
+                    reference_bases=variant_info['reference_bases'],
+                    alternate_bases=variant_info['alternate_bases']
+                )
 
-            if variant_predictions:
-                ref_vector = flatten_predictions_to_vector(variant_predictions.reference)
-                alt_vector = flatten_predictions_to_vector(variant_predictions.alternate)
-            
-                if feature_type == 'delta' or feature_type == 'randomized_delta':
-                    if ref_vector.size > 0 and alt_vector.size > 0 and ref_vector.shape == alt_vector.shape:
-                        delta_vector = alt_vector - ref_vector
-                        local_feature_vectors[target_id] = delta_vector
-                elif feature_type == 'mutant_only':
-                    if alt_vector.size > 0:
-                        local_feature_vectors[target_id] = alt_vector
-                elif feature_type == 'wt_only':
-                    if ref_vector.size > 0:
-                        local_feature_vectors[target_id] = ref_vector
-                else:
-                    raise ValueError(f"Invalid --feature_type {feature_type}")
+                variant_predictions = ag_model_client.predict_variant(
+                    interval=interval, variant=variant,
+                    requested_outputs=list(dna_client.OutputType),
+                    ontology_terms=['EFO:0002067']
+                )
 
-            time.sleep(0.2) # Add a slightly longer delay to be kind to APIs in parallel
+                if variant_predictions:
+                    ref_vector = flatten_predictions_to_vector(variant_predictions.reference)
+                    alt_vector = flatten_predictions_to_vector(variant_predictions.alternate)
+
+                    out_vec = None
+
+                    if feature_type == 'delta' or feature_type == 'randomized_delta':
+                        if ref_vector.size > 0 and alt_vector.size > 0 and ref_vector.shape == alt_vector.shape:
+                            out_vec = alt_vector - ref_vector
+                    elif feature_type == 'mutant_only':
+                        if alt_vector.size > 0:
+                            out_vec = alt_vector
+                    elif feature_type == 'wt_only':
+                        if ref_vector.size > 0:
+                            out_vec = ref_vector
+                    else:
+                        raise ValueError(f"Invalid --feature_type {feature_type}")
+
+                    if out_vec is not None:
+                        # approximate the effect of a compound mutatation assuming additivity
+                        if target_id in local_feature_vectors:
+                            local_feature_vectors[target_id] += out_vec
+                        else:
+                            local_feature_vectors[target_id] = out_vec
+
+            time.sleep(0.2)
 
     except Exception as e:
         return f"An unexpected error occurred while processing {uniprot_id}: {e} (Line: {e.__traceback__.tb_lineno})"
@@ -329,16 +354,14 @@ def main(args):
     feature_vectors = {}
     
     with ProcessPoolExecutor(max_workers=args.num_workers) as executor:
-        # Submit all jobs to the pool
         future_to_uniprot = {executor.submit(process_uniprot_id, uid, uniprot_to_mutations, args.max_transcripts_to_check,
                                              args.feature_type, api_key, args.random_seed): uid for uid in unique_uniprots}
         
-        # Process results as they complete
         for future in tqdm(as_completed(future_to_uniprot), total=len(unique_uniprots), desc="Processing Proteins"):
             result = future.result()
             if isinstance(result, dict):
                 feature_vectors.update(result)
-            elif isinstance(result, str): # It's an error message
+            elif isinstance(result, str):
                 tqdm.write(result)
             
     print(f"\nSuccessfully generated {len(feature_vectors)} feature vectors.")
@@ -360,5 +383,3 @@ if __name__ == '__main__':
                         help='Number of parallel worker processes to use.')
     args = parser.parse_args()
     main(args)
-
-

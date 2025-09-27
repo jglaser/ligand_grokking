@@ -4,16 +4,25 @@ import numpy as np
 import re
 from tqdm.auto import tqdm
 
-def parse_mutation(target_name: str) -> str | None:
+def parse_multiple_mutations_to_string(target_name: str) -> str | None:
     """
-    Uses regular expressions to find and extract a single point mutation
-    from a protein target name string.
+    Uses regular expressions to find and extract one or more point mutations
+    from a protein target name string and returns them as a comma-separated string.
     """
     if not isinstance(target_name, str):
         return None
-    match = re.search(r'[\(\[]([A-Z]\d+[A-Z])[\s\w]*[\)\]]', target_name)
-    if match:
-        return match.group(1)
+    
+    # This regex specifically finds patterns like 'L99A' (letter-digits-letter)
+    mutation_pattern = r'[A-Z]\d+[A-Z]'
+    
+    # re.findall returns all non-overlapping matches as a list of strings
+    mutations = re.findall(mutation_pattern, target_name)
+    
+    # If the list of mutations is not empty, join them into a string
+    if mutations:
+        return ",".join(np.unique(mutations))
+    
+    # Otherwise, return None
     return None
 
 def main(args):
@@ -54,11 +63,11 @@ def main(args):
     # --- Parse Mutations ---
     print("Parsing mutations from target names...")
     tqdm.pandas(desc="Parsing Mutations")
-    df['mutation'] = df['Target Name'].progress_apply(parse_mutation)
+    df['mutation'] = df['Target Name'].progress_apply(parse_multiple_mutations_to_string)
     
     df_wt = df[df['mutation'].isnull()].copy()
-    df_mt = df[df['mutation'].notnull()].copy()
-    
+    df_mt = df[df['mutation'].notnull()].copy() 
+
     print(f"Found {len(df_wt)} wild-type and {len(df_mt)} mutant measurements with associated PDB IDs.")
     
     # --- Create WT Lookup Dictionary ---
