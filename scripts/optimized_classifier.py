@@ -223,14 +223,25 @@ def predict_probas_batched(params, scaler_params, ligand_indices, protein_indice
 def _scaler_fit_step(i, scaler_state, unique_ligands, unique_proteins, train_ligand_indices, train_protein_indices, fit_batch_size):
     """A single, JIT-compiled step for fitting the scaler."""
     start_idx = i * fit_batch_size
-    # Use dynamic slices to handle batches within a JIT context
     batch_ligand_idx = jax.lax.dynamic_slice_in_dim(train_ligand_indices, start_idx, fit_batch_size, axis=0)
     batch_protein_idx = jax.lax.dynamic_slice_in_dim(train_protein_indices, start_idx, fit_batch_size, axis=0)
-
-    # Assemble the feature batch on-the-fly
+    
     X_batch = jnp.concatenate([unique_ligands[batch_ligand_idx], unique_proteins[batch_protein_idx]], axis=1)
+    
+    return scaler_update(scaler_state, X_batch)
 
-    # Update and return the new scaler state
+@jax.jit
+def fit_scaler_batch(scaler_state, batch_ligand_idx, batch_protein_idx, unique_ligands, unique_proteins):
+    """
+    JIT-compiled function to assemble one batch of features on-device and update the scaler.
+    """
+    # Assemble the batch *inside* the JIT'd function using the provided indices
+    X_batch = jnp.concatenate([
+        unique_ligands[batch_ligand_idx],
+        unique_proteins[batch_protein_idx]
+    ], axis=1)
+
+    # Perform the scaler update on the assembled batch
     return scaler_update(scaler_state, X_batch)
 
 def main(args):
@@ -314,27 +325,35 @@ def main(args):
     print("\n--- Fitting the JAX StandardScaler on training data ---")
     n_features = unique_ligands.shape[1] + unique_proteins.shape[1]
     n_train_samples = train_labels.shape[0]
+    fit_batch_size = args.fit_batch_size
     
-    # <<< CHANGE: Use batch size from args instead of hardcoding
-    fit_batch_size = args.fit_batch_size 
-    
-    initial_scaler_state = scaler_init(n_features)
-    num_fit_batches = int(np.ceil(n_train_samples / fit_batch_size))
-    
-    # <<< CHANGE: Define a lambda to correctly pass arguments to the JIT-ted function.
-    # This prevents JAX from capturing the large arrays as constants.
-    fit_loop_body = lambda i, state: _scaler_fit_step(
-        i, state, unique_ligands, unique_proteins, train_ligand_indices, train_protein_indices, fit_batch_size
-    )
-    
-    # Run the fitting loop using the correctly structured body function
-    final_running_state = jax.lax.fori_loop(0, num_fit_batches, fit_loop_body, initial_scaler_state)
-    
+    scaler_state = scaler_init(n_features)
+
+    # <<< FIX: This loop now only prepares small index arrays.
+    # The expensive work is offloaded to the JIT-compiled `fit_scaler_batch` function.
+    for i in tqdm(range(0, n_train_samples, fit_batch_size), desc="Fitting Scaler"):
+        start_idx = i
+        end_idx = min(i + fit_batch_size, n_train_samples)
+        
+        # Prepare the small "call number" index arrays on the host
+        batch_ligand_idx = train_ligand_indices[start_idx:end_idx]
+        batch_protein_idx = train_protein_indices[start_idx:end_idx]
+
+        # Call the JIT function, passing the large tables and small indices.
+        # This correctly instructs the device to perform the lookup and update.
+        scaler_state = fit_scaler_batch(
+            scaler_state, 
+            batch_ligand_idx, 
+            batch_protein_idx, 
+            unique_ligands, 
+            unique_proteins
+        )
+
     # Finalize the scaler to get the mean and scale vectors for transformation
-    scaler_params = scaler_finalize(final_running_state)
-    scaler_params['mean'].block_until_ready() # Ensure fitting is complete
+    scaler_params = scaler_finalize(scaler_state)
+    scaler_params['mean'].block_until_ready() # Ensure all updates are complete
     print("✅ Scaler fitted.")
-    
+
     # --- Phase 2: Heuristic for `t0` learning rate schedule ---
     print("\n--- Estimating t0 using scikit-learn's heuristic ---")
     typw = jnp.sqrt(1.0 / jnp.sqrt(args.alpha))
