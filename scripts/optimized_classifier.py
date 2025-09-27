@@ -511,7 +511,7 @@ if __name__ == '__main__':
 
     parser.add_argument('--predict_batch_size', type=int, default=32, help="Batch size for inference.")
     # Model args
-    parser.add_argument('--learning_rate', type=float, default=1e-5, help="Learning rate")
+    parser.add_argument('--learning_rate', type=float, default=1e-4, help="Learning rate")
     parser.add_argument('--alpha', type=float, default=1e-6, help="Regularization strength (like in sklearn).")
     parser.add_argument('--l1_ratio', type=float, default=0.15, help="Elastic Net mixing parameter (0=L2, 1=L1).")
     # Training loop args
