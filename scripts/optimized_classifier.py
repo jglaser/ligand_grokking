@@ -56,11 +56,60 @@ class HuggingFaceFeaturizer:
 # =============================================================================
 # 3. JAX-BASED SCALER & UTILS (Unchanged)
 # =============================================================================
+
+def scaler_init(n_features):
+    """Initializes the state for the online scaler."""
+    # State consists of count, mean, and M2 (sum of squares of differences from the current mean)
+    return {
+        'count': jnp.zeros((), dtype=jnp.int32),
+        'mean': jnp.zeros(n_features, dtype=jnp.float32),
+        'M2': jnp.zeros(n_features, dtype=jnp.float32)
+    }
+
+@jax.jit
+def scaler_update(scaler_state, X_batch):
+    """
+    Updates the scaler state using a batch of data. Implements a vectorized
+    version of Welford's algorithm for combining summary statistics.
+    """
+    batch_count = X_batch.shape[0]
+    # This check is important for the last batch which might be empty if total_size % batch_size == 0
+    if batch_count == 0:
+        return scaler_state
+
+    batch_mean = jnp.mean(X_batch, axis=0)
+    batch_M2 = jnp.sum(jnp.square(X_batch - batch_mean), axis=0)
+
+    # Combine the statistics from the existing state and the new batch
+    new_count = scaler_state['count'] + batch_count
+    delta = batch_mean - scaler_state['mean']
+
+    new_mean = scaler_state['mean'] + delta * (batch_count / new_count)
+
+    # M2 update: old M2 + batch M2 + correction term for combining variances
+    new_M2 = scaler_state['M2'] + batch_M2 + jnp.square(delta) * scaler_state['count'] * batch_count / new_count
+
+    return {'count': new_count, 'mean': new_mean, 'M2': new_M2}
+
+def scaler_finalize(scaler_state):
+    """Calculates final variance and scale from the accumulated M2 state."""
+    count = scaler_state['count']
+    mean = scaler_state['mean']
+    M2 = scaler_state['M2']
+
+    # Calculate population variance. Use a safe default of 0 if no data was seen.
+    var = jnp.where(count > 0, M2 / count, 0.0)
+    scale = jnp.sqrt(var)
+    # Don't scale features with zero variance to avoid NaNs.
+    scale = jnp.where(scale == 0, 1.0, scale)
+
+    return {'mean': mean, 'scale': scale}
+
 @jax.jit
 def scaler_transform(scaler_params, X):
     """Applies MaxAbs scaling with numerical stability."""
     epsilon = 1e-6
-    return X / (scaler_params['max_abs'] + epsilon)
+    return (X - scaler_params['mean']) / (scaler_params['scale'] + epsilon)
 
 # =============================================================================
 # 4. JAX-BASED MODEL & TRAINING CORE (Updated)
@@ -205,28 +254,32 @@ def main(args):
     print("✅ Training data loaded to JAX device.")
 
     # --- Phase 1.5: Fit a MaxAbs Scaler (Unchanged) ---
-    print("\n--- Fitting a MaxAbs Scaler on-device ---")
+    print("\n--- Fitting a Standard scaler on-device ---")
     n_features = unique_ligands.shape[1] + unique_proteins.shape[1]
     n_train_samples = train_labels.shape[0]
     fit_batch_size = args.fit_batch_size
-    max_abs_vector = jnp.zeros((n_features,))
 
     @jax.jit
-    def get_columnwise_max_abs_batch(batch_ligand_idx, batch_protein_idx, unique_ligands, unique_proteins):
+    def fit_standard_scaler_batch(scaler_state, batch_ligand_idx, batch_protein_idx, unique_ligands, unique_proteins):
         X_batch = jnp.concatenate([unique_ligands[batch_ligand_idx], unique_proteins[batch_protein_idx]], axis=1)
-        return jnp.max(jnp.abs(X_batch), axis=0)
+        return scaler_update(scaler_state, X_batch)
 
-    for i in tqdm(range(0, n_train_samples, fit_batch_size), desc="Finding Max Abs"):
+    # Initialize the scaler state (count=0, mean=0, M2=0)
+    scaler_state = scaler_init(n_features)
+
+    for i in tqdm(range(0, n_train_samples, fit_batch_size), desc="Standard scaler"):
         start_idx, end_idx = i, min(i + fit_batch_size, n_train_samples)
         batch_ligand_idx = train_ligand_indices[start_idx:end_idx]
         batch_protein_idx = train_protein_indices[start_idx:end_idx]
-        batch_max_abs_vec = get_columnwise_max_abs_batch(batch_ligand_idx, batch_protein_idx, unique_ligands, unique_proteins)
-        max_abs_vector = jnp.maximum(max_abs_vector, batch_max_abs_vec)
+        scaler_state = fit_standard_scaler_batch(
+            scaler_state, batch_ligand_idx, batch_protein_idx, unique_ligands, unique_proteins
+        )
 
-    scaler_params = {'max_abs': max_abs_vector}
-    scaler_params['max_abs'].block_until_ready()
-    print("✅ MaxAbs scaler fitted on-device.")
-    
+    # Finalize the calculation to get the mean and scale (std dev)
+    scaler_params = scaler_finalize(scaler_state)
+    scaler_params['mean'].block_until_ready()
+    print("✅ Standard scaler fitted on-device.")
+
     # --- Phase 3: Initialize Model State (Unchanged) ---
     params = {'w': jnp.zeros((1, n_features)), 'b': jnp.zeros(1)}
     opt_state = optimizer.init(params)
