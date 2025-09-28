@@ -296,35 +296,6 @@ def main(args):
 
     print("✅ In-memory data preparation complete.")
 
-    # =============================================================================
-    # --- Phase 1.25: Project Unique Feature Tables (Final Version) ---
-    # =============================================================================
-    from sklearn.random_projection import SparseRandomProjection
-
-    print(f"\n--- Projecting unique feature tables ---")
-
-    n_components = 2048 # This is now the final number of features for the model
-    n_ligand_features = smiles_embeddings.shape[1]
-    n_protein_features = protein_embeddings.shape[1]
-    n_total_features = n_ligand_features + n_protein_features
-
-    # 1. Initialize the projector to create the random matrix `R`
-    projector = SparseRandomProjection(n_components=n_components, random_state=args.random_seed).fit(np.zeros((1, n_total_features)))
-    random_matrix = projector.components_.T.toarray()
-
-    # 2. Split `R` into ligand and protein parts
-    R_ligand = random_matrix[:n_ligand_features, :]
-    R_protein = random_matrix[n_ligand_features:, :]
-
-    # 3. Pre-compute the new, low-dimensional unique feature tables
-    unique_ligands_projected = smiles_embeddings @ R_ligand
-    unique_proteins_projected = protein_embeddings @ R_protein
-
-    # Clear the original large arrays from memory
-    del smiles_embeddings, protein_embeddings, random_matrix, R_ligand, R_protein
-
-    print(f"✅ Unique features projected to {n_components} dimensions.")
-
     # --- JAX Setup ---
     key = jax.random.PRNGKey(args.random_seed)
     
@@ -339,8 +310,8 @@ def main(args):
     # --- Phase 1: Load all data to JAX device ---
     print("\n--- Loading all data to JAX device ---")
     
-    unique_ligands = jax.device_put(unique_ligands_projected)
-    unique_proteins = jax.device_put(unique_proteins_projected)
+    unique_ligands = jax.device_put(smiles_embeddings)
+    unique_proteins = jax.device_put(protein_embeddings)
     
     # The index and label arrays are loaded as before
     train_ligand_indices = jax.device_put(train_ligand_indices)
