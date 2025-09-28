@@ -321,16 +321,16 @@ def process_uniprot_id(uniprot_id, uniprot_to_mutations, max_transcripts_to_chec
 
         for mutation, mutation_label  in zip(mutations, shuffled_mutations):
             target_id = f"{uniprot_id}_{mutation_label}"
-            variant_info, reason = get_variant_info(uniprot_seq, transcript, mutation, gene_data['strand'])
-           
-            if not variant_info:
-                tqdm.write(f"Warning: Could not map mutation {mutation} to genome for {uniprot_id}. Reason: {reason}")
-                continue
             all_mutations = mutation.split(',')
 
             for point_mutation in all_mutations:
+                variant_info, reason = get_variant_info(uniprot_seq, transcript, point_mutation, gene_data['strand'])
+                if not variant_info:
+                    tqdm.write(f"Warning: Could not map mutation {point_mutation} to genome for {uniprot_id}. Reason: {reason}")
+                    continue
+
                 variant = genome.Variant(
-                    chromosome=chromosome, 
+                    chromosome=chromosome,
                     position=variant_info['position'],
                     reference_bases=variant_info['reference_bases'],
                     alternate_bases=variant_info['alternate_bases']
