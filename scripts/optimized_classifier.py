@@ -177,7 +177,8 @@ def train_step(state, data, learning_rate, scaler_params, unique_ligands, unique
         X_sample = jnp.concatenate([unique_ligands[ligand_idx], unique_proteins[protein_idx]])
         X_scaled = scaler_transform(scaler_params, X_sample)
         logits = X_scaled @ p['w'].T + p['b']
-        return optax.sigmoid_binary_cross_entropy(logits, y).mean()
+        l2_penalty = 0.5 * (1 - l1_ratio) * alpha * jnp.sum(p['w']**2)
+        return optax.sigmoid_binary_cross_entropy(logits, y).mean() + l2_penalty
 
     # Calculate loss and gradients on the data-only loss
     loss, grads = jax.value_and_grad(loss_fn)(params)
@@ -301,10 +302,9 @@ def main(args):
     
     # Create a robust optimizer chain
     # The L2 penalty (weight decay) is now handled directly by the optimizer
-    weight_decay = (1 - args.l1_ratio) * args.alpha
     optimizer = optax.chain(
         optax.clip_by_global_norm(1.0),
-        optax.adamw(learning_rate=args.learning_rate, weight_decay=weight_decay)
+        optax.sgd(learning_rate=args.learning_rate)
     )
 
     # --- Phase 1: Load all data to JAX device ---
@@ -464,6 +464,11 @@ def main(args):
         score = roc_auc_score(y_test, np.asarray(predictions))
 
         print(f"Test Set ROC AUC Score: {score:.4f}")
+
+    num_protein_features = protein_embeddings.shape[1]
+    selected_coeffs = final_params['w'][0, -num_protein_features:]
+    num_selected = np.sum(selected_coeffs != 0)
+    print(f"\nL1 regularization selected {num_selected} out of {num_protein_features} genomic features.")
 
     total_time = time.time() - start_time
     print(f"\nTotal pipeline time: {total_time:.2f} seconds")
