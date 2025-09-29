@@ -75,13 +75,19 @@ def main(args):
     # Transform each feature set with the corresponding part of the learned scaler
     scaled_ligands = (ligand_features - scaler.mean_[:ligand_dim]) / jnp.sqrt(scaler.var_[:ligand_dim] + 1e-7)
     scaled_proteins = (protein_features - scaler.mean_[ligand_dim:]) / jnp.sqrt(scaler.var_[ligand_dim:] + 1e-7)
-    
+
+    def normalize(x, axis=None, epsilon=1e-12):
+        square_sum = jnp.sum(jnp.square(x), axis=axis, keepdims=True)
+        x_inv_norm = 1. / jnp.sqrt(jnp.maximum(square_sum, epsilon))
+        return x * x_inv_norm
+
     # Sample-wise L2 normalization
-    norm_scaled_ligands = jax.nn.normalize(scaled_ligands, axis=1)
-    norm_scaled_proteins = jax.nn.normalize(scaled_proteins, axis=1)
+    norm_scaled_ligands = normalize(scaled_ligands, axis=1)
+    norm_scaled_proteins = normalize(scaled_proteins, axis=1)
 
     # --- 6. Train Out-of-Core JAX SVM ---
-    svm = JaxOutOfCoreSVM(C=args.C, max_iter=args.epochs, random_seed=args.random_seed)
+    svm = JaxOutOfCoreSVM(C=args.C, max_iter=args.epochs, random_seed=args.random_seed,
+                          predict_batch_size=args.predict_batch_size)
     
     # The SVM already operates on indexed pairs, so we pass the data directly
     svm.fit(
@@ -101,6 +107,8 @@ def main(args):
     
     score = roc_auc_score(y_test, predictions)
 
+    print("\nEvaluating model on the train set...")
+    predictions = svm.decision_function(
     predictions_train = svm.decision_function(
         norm_scaled_ligands,
         norm_scaled_proteins,
@@ -122,16 +130,9 @@ if __name__ == '__main__':
     parser.add_argument('--random_seed', type=int, default=42)
     parser.add_argument('--epochs', type=int, default=100, help="Number of epochs for SVM training.")
     parser.add_argument('--batch_size', type=int, default=32, help="Batch size for scaler fitting.")
+    parser.add_argument('--predict_batch_size', type=int, default=32, help="Batch size for inference.")
     parser.add_argument('--C', type=float, default=1.0, help="Regularization parameter for the SVM.")
     args = parser.parse_args()
-    
-    # A little patch because I used jax.nn.normalize which doesn't exist.
-    # A proper implementation would be to define it, but for a script this is fine.
-    def normalize_manual(x, axis=None, epsilon=1e-12):
-        square_sum = jnp.sum(jnp.square(x), axis=axis, keepdims=True)
-        x_inv_norm = 1. / jnp.sqrt(jnp.maximum(square_sum, epsilon))
-        return x * x_inv_norm
-    jax.nn.normalize = normalize_manual
 
     main(args)
 
