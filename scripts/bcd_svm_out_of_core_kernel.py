@@ -6,8 +6,8 @@ from tqdm.auto import tqdm
 
 class JaxOutOfCoreKernelSVM:
     """
-    An "out-of-core" Kernel SVM with corrected JIT compilation for both
-    training and prediction to avoid capturing large constants.
+    An "out-of-core" Kernel SVM with a robust training loop that shuffles
+    data and runs for a full number of epochs to ensure better convergence.
     """
     def __init__(self, C=1.0, tol=1e-4, max_iter=1000, random_seed=42, 
                  epsilon=1e-5, jitter=1e-6, predict_batch_size=128,
@@ -19,15 +19,18 @@ class JaxOutOfCoreKernelSVM:
         self.epsilon = epsilon
         self.jitter = jitter
         self.predict_batch_size = predict_batch_size
+
         self.kernel_name = kernel
         self.gamma = gamma
         self.kernel = self._get_kernel_function()
+
         self.alphas = None
         self.b = 0.0
         self.train_pairs = None
         self.y_train = None
 
     def _get_kernel_function(self):
+        """Factory to get the desired kernel function."""
         if self.kernel_name == 'rbf':
             def rbf_kernel(x1, x2):
                 return jnp.exp(-self.gamma * jnp.sum((x1 - x2)**2))
@@ -36,6 +39,9 @@ class JaxOutOfCoreKernelSVM:
             raise ValueError(f"Unsupported kernel: {self.kernel_name}")
 
     def fit(self, X_ligand, X_protein, train_pairs, y):
+        """
+        Fits the Kernel SVM model.
+        """
         if jnp.array_equal(jnp.unique(y), jnp.array([0, 1])):
             print("Labels detected as {0, 1}. Converting to {-1, 1} for SVM formulation.")
             y = jnp.where(y == 0, -1, 1)
@@ -58,15 +64,19 @@ class JaxOutOfCoreKernelSVM:
         for iter_num in range(self.max_iter):
             self.key, subkey = jax.random.split(self.key)
             shuffled_indices = jax.random.permutation(subkey, n_samples)
+            
             initial_carry = (self.alphas, self.b, errors, 0)
             
             final_carry = run_epoch(initial_carry, shuffled_indices, X_ligand, X_protein, train_pairs, y)
             
             self.alphas, self.b, errors, alphas_changed = final_carry
+
             print(f"Iteration {iter_num + 1}/{self.max_iter} | Alpha pairs changed: {alphas_changed}")
-            if alphas_changed == 0 and iter_num > 1:
-                print("Convergence reached.")
-                break
+            
+            # --- FIX: Removed the premature early stopping condition ---
+            # We now let the training run for the full number of epochs to allow
+            # shuffling to help the optimizer find the true global minimum.
+            
         print("Training finished.")
 
     def _make_epoch_body(self, X_lig, X_prot, pairs, y):
@@ -89,6 +99,7 @@ class JaxOutOfCoreKernelSVM:
         return epoch_body
 
     def _make_update_step(self, X_lig, X_prot, pairs, y):
+        # This function remains unchanged
         def update_step(alphas, b, errors, i, j):
             x_i = jnp.concatenate([X_lig[pairs[i, 0]], X_prot[pairs[i, 1]]])
             x_j = jnp.concatenate([X_lig[pairs[j, 0]], X_prot[pairs[j, 1]]])
@@ -134,9 +145,9 @@ class JaxOutOfCoreKernelSVM:
         return update_step
 
     def decision_function(self, X_ligand, X_protein, test_pairs):
+        # This function remains unchanged
         n_test = test_pairs.shape[0]
         all_scores = jnp.zeros(n_test)
-
         sv_indices = jnp.where(self.alphas > self.epsilon)[0]
         sv_alphas = self.alphas[sv_indices]
         sv_y = self.y_train[sv_indices]
@@ -144,13 +155,11 @@ class JaxOutOfCoreKernelSVM:
         
         print(f"Making predictions using {len(sv_indices)} support vectors.")
 
-        # --- FIX: Pass large arrays as explicit arguments to the JIT'd function ---
         @jax.jit
         def predict_batch(x_lig, x_prot, batch_test_pairs):
-            
             def single_prediction(test_pair):
                 x_test = jnp.concatenate([x_lig[test_pair[0]], x_prot[test_pair[1]]])
-
+                
                 @jax.vmap
                 def kernel_vmap(sv_pair):
                     x_sv = jnp.concatenate([x_lig[sv_pair[0]], x_prot[sv_pair[1]]])
@@ -163,7 +172,6 @@ class JaxOutOfCoreKernelSVM:
 
         for i in tqdm(range(0, n_test, self.predict_batch_size), desc="Predicting in batches"):
             batch_pairs = test_pairs[i:i+self.predict_batch_size]
-            # --- And pass them in the call here ---
             batch_scores = predict_batch(X_ligand, X_protein, batch_pairs)
             all_scores = all_scores.at[i:i+len(batch_scores)].set(batch_scores)
 
