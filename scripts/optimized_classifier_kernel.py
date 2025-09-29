@@ -80,7 +80,8 @@ def main(args):
     # --- 6. Train Out-of-Core JAX Kernel SVM ---
     gamma = args.gamma
     svm = JaxOutOfCoreKernelSVM(C=args.C, max_iter=args.epochs, random_seed=args.random_seed,
-                                predict_batch_size=args.predict_batch_size, gamma=args.gamma)
+                                predict_batch_size=args.predict_batch_size, gamma=args.gamma,
+                                tol=args.tol)
 
     svm.fit(
         norm_scaled_ligands,
@@ -121,6 +122,7 @@ if __name__ == '__main__':
     parser.add_argument('--batch_size', type=int, default=32, help="Batch size for scaler fitting.")
     parser.add_argument('--predict_batch_size', type=int, default=32, help="Batch size for inference.")
     parser.add_argument('--C', type=float, default=1.0, help="Regularization parameter for the SVM.")
+    parser.add_argument('--tol', type=float, default=1e-7, help="KKT tolerance.")
     parser.add_argument('--gamma', type=float, default=0.01, help="Gamma parameter for the RBF kernel.")
     args = parser.parse_args()
 
