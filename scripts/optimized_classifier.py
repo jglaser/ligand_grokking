@@ -61,7 +61,7 @@ def main(args):
     
     # Shuffle the training pairs for better statistics calculation
     shuffled_indices = np.arange(len(train_pairs))
-    np.random.shuffle(shuffled_indices)
+    np.random.default_rng(args.random_seed).shuffle(shuffled_indices)
 
     for i in tqdm(range(0, len(train_pairs), args.batch_size)):
         batch_indices = shuffled_indices[i:i+args.batch_size]
@@ -100,8 +100,18 @@ def main(args):
     )
     
     score = roc_auc_score(y_test, predictions)
+
+    predictions_train = svm.decision_function(
+        norm_scaled_ligands,
+        norm_scaled_proteins,
+        train_pairs
+    )
+
+    score_train = roc_auc_score(y_train, predictions_train)
+
     print("\n--- Results ---")
     print(f"Test Set ROC AUC Score: {score:.4f}")
+    print(f"Train Set ROC AUC Score: {score_train:.4f}")
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Train a drug resistance classifier using the Out-of-Core JAX SVM.")
@@ -111,7 +121,7 @@ if __name__ == '__main__':
     parser.add_argument('--ligand_featurizer', type=str, default='ibm/MoLFormer-XL-both-10pct')
     parser.add_argument('--random_seed', type=int, default=42)
     parser.add_argument('--epochs', type=int, default=100, help="Number of epochs for SVM training.")
-    parser.add_argument('--batch_size', type=int, default=256, help="Batch size for scaler fitting.")
+    parser.add_argument('--batch_size', type=int, default=32, help="Batch size for scaler fitting.")
     parser.add_argument('--C', type=float, default=1.0, help="Regularization parameter for the SVM.")
     args = parser.parse_args()
     
