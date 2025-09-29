@@ -14,8 +14,8 @@ from sklearn.pipeline import Pipeline
 
 class JaxKernelSVM:
     """
-    A final, corrected Kernel SVM with proper JIT compilation patterns for
-    prediction, resolving the non-hashable arguments error.
+    A Kernel SVM with a robust, JAX-idiomatic fallback strategy
+    to prevent premature convergence.
     """
     def __init__(self, C=1.0, tol=1e-4, max_iter=1000, random_seed=42,
                  epsilon=1e-5, jitter=1e-6, kernel='rbf', gamma='scale'):
@@ -25,7 +25,7 @@ class JaxKernelSVM:
         self.key = jax.random.PRNGKey(random_seed)
         self.epsilon = epsilon
         self.jitter = jitter
-        self.gamma_val = gamma 
+        self.gamma_val = gamma
 
         self.alphas = None
         self.b = 0.0
@@ -65,7 +65,6 @@ class JaxKernelSVM:
         
         return jnp.nan_to_num(X_normalized)
 
-
     def fit(self, X, y):
         unique_labels = jnp.unique(y)
         if jnp.all(jnp.sort(unique_labels) == jnp.array([0, 1])):
@@ -90,12 +89,13 @@ class JaxKernelSVM:
 
         print(f"Starting JIT-compiled Kernel SVM training (kernel: {self.kernel_name})...")
         for iter_num in range(self.max_iter):
-            initial_carry = (self.alphas, self.b, errors, 0)
             self.key, subkey = jax.random.split(self.key)
+            # Pass the PRNGKey into the scan's carry state for use in fallbacks
+            initial_carry = (self.alphas, self.b, errors, 0, subkey)
             shuffled_indices = jax.random.permutation(subkey, n_samples)
             
             final_carry = run_epoch(initial_carry, shuffled_indices)
-            self.alphas, self.b, errors, alphas_changed = final_carry
+            self.alphas, self.b, errors, alphas_changed, _ = final_carry
             
             print(f"Iteration {iter_num + 1}/{self.max_iter} | Alpha pairs changed: {alphas_changed}")
             if alphas_changed == 0 and iter_num > 1:
@@ -104,51 +104,123 @@ class JaxKernelSVM:
         print("Training finished.")
 
     def decision_function(self, X):
-        """Computes the decision function for a given set of samples."""
         X_processed = self._preprocess(X, fit_transform=False)
-
-        # --- FIX: Define a static helper function to JIT ---
-        # This function does not close over 'self' and only takes JAX arrays.
         @jax.jit
         def batch_predict(alphas, y_train, b, x_train, x_test_batch):
             def single_prediction(x_test):
                 kernel_values = jax.vmap(self.kernel, in_axes=(0, None))(x_train, x_test)
                 return jnp.dot(alphas * y_train, kernel_values) + b
             return jax.vmap(single_prediction)(x_test_batch)
-
-        # Call the JIT'd function with the necessary data from the class
         return batch_predict(self.alphas, self.y_train, self.b, self.X_train, X_processed)
 
     def predict(self, X):
-        """Predicts the class labels for a given set of samples."""
-        # The decision_function is now safe to call, as the JIT is handled internally
         return jnp.sign(self.decision_function(X))
 
+    def _make_search_loop(self, X, y, update_step_fn):
+        """Creates a JIT-compatible search loop over candidate indices for j."""
+        def search_for_j(carry, candidate_indices):
+            alphas, b, errors, i = carry
+
+            def loop_cond(state):
+                # State: (alphas, b, errors, changed_flag, search_idx)
+                _, _, _, changed, search_idx = state
+                return jnp.logical_and(jnp.logical_not(changed), search_idx < candidate_indices.shape[0])
+
+            # In _make_search_loop
+            def loop_body(state):
+                alphas_s, b_s, errors_s, _, search_idx = state
+                j = candidate_indices[search_idx]
+
+                def do_update(_):
+                    # This is the original update logic
+                    return update_step_fn(alphas_s, b_s, errors_s, i, j)
+
+                def do_nothing(_):
+                    # If j is -1, do nothing and report no change
+                    return alphas_s, b_s, errors_s, False
+
+                # Only run the update if the index 'j' is valid
+                new_alphas, new_b, new_errors, changed = jax.lax.cond(
+                    j != -1,
+                    do_update,
+                    do_nothing,
+                    None # Operand is not needed here
+                )
+
+                # Conditionally update state: if no change, carry old state forward
+                final_alphas = jax.lax.cond(changed, lambda: new_alphas, lambda: alphas_s)
+                final_b = jax.lax.cond(changed, lambda: new_b, lambda: b_s)
+                final_errors = jax.lax.cond(changed, lambda: new_errors, lambda: errors_s)
+
+                return (final_alphas, final_b, final_errors, changed, search_idx + 1)
+
+            # Initialize state for the while_loop
+            init_state = (alphas, b, errors, False, 0)
+            final_alphas, final_b, final_errors, changed, _ = jax.lax.while_loop(loop_cond, loop_body, init_state)
+            return final_alphas, final_b, final_errors, changed
+        
+        return search_for_j
 
     def _make_epoch_body(self, X, y):
+        n_samples = X.shape[0]
         update_step_fn = self._make_update_step(X, y)
+        search_loop_fn = self._make_search_loop(X, y, update_step_fn)
 
         def epoch_body(carry, i):
-            alphas, b, errors, alphas_changed_count = carry
+            alphas, b, errors, alphas_changed_count, key = carry
             error_i = errors[i]
             
             kkt_violated = ((y[i] * error_i < -self.tol) & (alphas[i] < self.C)) | \
                            ((y[i] * error_i > self.tol) & (alphas[i] > 0))
 
             def perform_update(operands):
-                alphas_op, b_op, errors_op, count_op = operands
+                alphas_op, b_op, errors_op, count_op, key_op = operands
+
+                # === HEURISTIC 1: Argmax ===
                 error_diffs = jnp.abs(error_i - errors_op)
-                j = jnp.argmax(error_diffs.at[i].set(-jnp.inf))
-                
-                new_alphas, new_b, new_errors, changed = update_step_fn(alphas_op, b_op, errors_op, i, j)
-                new_count = count_op + jnp.where(changed, 1, 0)
-                return new_alphas, new_b, new_errors, new_count
+                j_heuristic = jnp.argmax(error_diffs.at[i].set(-jnp.inf))
+                a1, b1, e1, c1 = update_step_fn(alphas_op, b_op, errors_op, i, j_heuristic)
+
+                def fallback_logic(state_and_key):
+                    a_in, b_in, e_in, k_in = state_and_key
+                    k_in, subkey1, subkey2 = jax.random.split(k_in, 3)
+
+                    # === HEURISTIC 2: Search non-bound support vectors ===
+                    sv_mask = (a_in > self.epsilon) & (a_in < self.C - self.epsilon)
+                    sv_indices = jnp.where(sv_mask, size=n_samples, fill_value=-1)[0]
+                    # The problematic line has been removed.
+                    shuffled_sv_indices = jax.random.permutation(subkey1, sv_indices)
+                    a2, b2, e2, c2 = search_loop_fn((a_in, b_in, e_in, i), shuffled_sv_indices)
+
+                    # === HEURISTIC 3: Search all points (if SV search fails) ===
+                    def full_scan(state):
+                        a_in2, b_in2, e_in2, _ = state
+                        all_indices = jnp.arange(n_samples)
+                        shuffled_all_indices = jax.random.permutation(subkey2, all_indices)
+                        return search_loop_fn((a_in2, b_in2, e_in2, i), shuffled_all_indices)
+                    
+                    # Conditionally run the full scan if the SV scan found nothing
+                    a_final, b_final, e_final, c_final = jax.lax.cond(
+                        c2, lambda s: (s[0], s[1], s[2], True), full_scan, (a2, b2, e2, c2)
+                    )
+                    return a_final, b_final, e_final, c_final, k_in
+
+                # Chain the heuristics using lax.cond
+                final_a, final_b, final_e, final_c, final_key = jax.lax.cond(
+                    c1,
+                    lambda _: (a1, b1, e1, c1, key_op), # <-- Corrected line
+                    fallback_logic,
+                    (alphas_op, b_op, errors_op, key_op)
+                )
+
+                new_count = count_op + jnp.where(final_c, 1, 0)
+                return final_a, final_b, final_e, new_count, final_key
 
             def no_update(operands):
                 return operands
             
             new_carry = jax.lax.cond(kkt_violated, perform_update, no_update, 
-                                     (alphas, b, errors, alphas_changed_count))
+                                     (alphas, b, errors, alphas_changed_count, key))
             return new_carry, None
         return epoch_body
 
@@ -195,8 +267,10 @@ class JaxKernelSVM:
 
             def no_op(_):
                 return alphas, b, errors, False
-
-            return jax.lax.cond((H - L > self.epsilon) & (eta < 0), optimization_logic, no_op, None)
+                
+            # Also ensure i != j to prevent eta from being exactly zero in some cases
+            is_valid_pair = jnp.logical_and(i != j, (H - L > self.epsilon) & (eta < 0))
+            return jax.lax.cond(is_valid_pair, optimization_logic, no_op, None)
         return update_step
 
 
@@ -234,7 +308,7 @@ if __name__ == '__main__':
     accuracy_sklearn = accuracy_score(y_test, y_pred_sklearn)
     
     print("\n\n" + "="*70)
-    print("--- FINAL BENCHMARK RESULTS (Matched Preprocessing & Correct JIT) ---")
+    print("--- FINAL BENCHMARK RESULTS (With Robust Fallback Logic) ---")
     print("="*70)
     print(f"{'Implementation':>15} | {'Train Time (s)':>18} | {'Accuracy (%)':>15}")
     print("-"*70)
