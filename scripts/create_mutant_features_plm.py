@@ -9,10 +9,11 @@ Workflow:
 1.  Reads Parquet files containing `uniprot_id` and `mutation` columns.
 2.  Groups all mutations by their unique UniProt ID.
 3.  For each UniProt ID, it fetches the canonical protein sequence once.
-4.  For each associated mutation (e.g., 'L99A'), it performs a strict sanity check
-    to ensure the reference amino acid at the specified position in the sequence
-    matches the mutation string.
-5.  Only validated mutations are used to create in-silico mutant sequences.
+4.  For each associated mutation string (e.g., 'L99A,V600E'), it splits the
+    string and applies each point mutation sequentially to generate a final
+    in-silico mutant sequence.
+5.  Each point mutation undergoes a strict sanity check to ensure the
+    reference amino acid at the specified position in the sequence matches.
 6.  It uses the `HuggingFaceFeaturizer` to embed all validated wild-type
     and mutant sequences in batches, leveraging TPU/GPU acceleration.
 7.  It calculates the "delta vector" (mutant_embedding - wild_type_embedding).
@@ -69,7 +70,7 @@ class HuggingFaceFeaturizer:
             
             # Use torch.compile for significant speedup if available
             if hasattr(torch, 'compile'):
-                self.models[model_name] = torch.compile(self.models[model_name], mode="max-autotune")
+                self.models[model_name] = torch.compile(self.models[model_name])
                 print("Model compilation enabled.")
         return self.models[model_name], self.tokenizers[model_name]
 
@@ -130,29 +131,42 @@ def main(args):
             wt_seq = "".join(fasta_data.splitlines()[1:])
             wt_sequences[uniprot_id] = wt_seq
             
-            for mutation in uniprot_to_mutations.get(uniprot_id, []):
-                match = re.match(r'([A-Z])(\d+)([A-Z])', mutation)
-                if not match:
-                    tqdm.write(f"Warning: Could not parse mutation format '{mutation}' for {uniprot_id}. Skipping.")
-                    continue
-                
-                ref_aa, pos_str, alt_aa = match.groups()
-                pos_idx = int(pos_str) - 1
-
-                # --- STRICT SANITY CHECK ---
-                # Ensure the position is valid and the reference AA matches the sequence
-                if not (0 <= pos_idx < len(wt_seq)):
-                    tqdm.write(f"Warning: Position {pos_str} is out of bounds for {uniprot_id} (length {len(wt_seq)}). Skipping {mutation}.")
-                    continue
-                
-                if wt_seq[pos_idx] != ref_aa:
-                    tqdm.write(f"Warning: Reference mismatch for {mutation} in {uniprot_id}. Expected {ref_aa}, found {wt_seq[pos_idx]}. Skipping.")
-                    continue
-
-                # If the check passes, create the mutant sequence
+            for mutation_str in uniprot_to_mutations.get(uniprot_id, []):
                 mutant_seq_list = list(wt_seq)
-                mutant_seq_list[pos_idx] = alt_aa
-                mutant_sequences[f"{uniprot_id}_{mutation}"] = "".join(mutant_seq_list)
+                valid_mutation = True
+                
+                # Split mutation string and apply sequentially
+                point_mutations = mutation_str.split(',')
+                
+                for point_mutation in point_mutations:
+                    match = re.match(r'([A-Z])(\d+)([A-Z])', point_mutation)
+                    if not match:
+                        tqdm.write(f"Warning: Could not parse mutation format '{point_mutation}' in '{mutation_str}' for {uniprot_id}. Skipping entire set.")
+                        valid_mutation = False
+                        break
+                    
+                    ref_aa, pos_str, alt_aa = match.groups()
+                    pos_idx = int(pos_str) - 1
+
+                    # --- STRICT SANITY CHECK ---
+                    # Use the current state of mutant_seq_list for validation
+                    current_seq_for_validation = "".join(mutant_seq_list)
+                    if not (0 <= pos_idx < len(current_seq_for_validation)):
+                        tqdm.write(f"Warning: Position {pos_str} is out of bounds for {uniprot_id} (length {len(current_seq_for_validation)}). Skipping {mutation_str}.")
+                        valid_mutation = False
+                        break
+                    
+                    if current_seq_for_validation[pos_idx] != ref_aa:
+                        tqdm.write(f"Warning: Reference mismatch for {point_mutation} in {uniprot_id}. Expected {ref_aa}, found {current_seq_for_validation[pos_idx]}. Skipping {mutation_str}.")
+                        valid_mutation = False
+                        break
+
+                    # If the check passes, apply the mutation
+                    mutant_seq_list[pos_idx] = alt_aa
+
+                # If all point mutations in the set were valid, store the final sequence
+                if valid_mutation:
+                    mutant_sequences[f"{uniprot_id}_{mutation_str}"] = "".join(mutant_seq_list)
 
         except Exception as e:
             tqdm.write(f"An unexpected error occurred processing {uniprot_id}: {e}")
@@ -182,7 +196,7 @@ def main(args):
         uniprot_id = target_id.split('_')[0]
         if uniprot_id in wt_embedding_map:
             wt_emb = wt_embedding_map[uniprot_id]
-            delta_vectors[target_id] = mutant_emb #- wt_emb
+            delta_vectors[target_id] = mutant_emb # - wt_emb
             
     print(f"\nSuccessfully generated {len(delta_vectors)} delta vectors.")
     if len(delta_vectors) > 0:
@@ -198,6 +212,6 @@ if __name__ == '__main__':
     parser.add_argument('--input_paths', nargs='+', required=True, help='Path(s) to the Parquet split files.')
     parser.add_argument('--output_path', type=str, default='mutant_delta_vectors_plm_aligned.npz')
     parser.add_argument('--model_name', type=str, default='Rostlab/prot_t5_xl_uniref50', help='Name of the Hugging Face model to use.')
-    parser.add_argument('--batch_size', type=int, default=16, help='Batch size for GPU/TPU processing.')
+    parser.add_argument('--batch_size', type=int, default=2, help='Batch size for GPU/TPU processing.')
     args = parser.parse_args()
     main(args)

@@ -11,90 +11,76 @@ def parse_multiple_mutations_to_string(target_name: str) -> str | None:
     """
     if not isinstance(target_name, str):
         return None
-    
-    # This regex specifically finds patterns like 'L99A' (letter-digits-letter)
     mutation_pattern = r'[A-Z]\d+[A-Z]'
-    
-    # re.findall returns all non-overlapping matches as a list of strings
     mutations = re.findall(mutation_pattern, target_name)
-    
-    # If the list of mutations is not empty, join them into a string
-    if mutations:
-        return ",".join(np.unique(mutations))
-    
-    # Otherwise, return None
-    return None
+    return ",".join(sorted(list(set(mutations)))) if mutations else None
 
 def main(args):
     print(f"Loading raw BindingDB data from: {args.binding_db_path}")
+    # --- CHANGE: Added 'Ligand InChI Key' to the columns to load ---
     use_cols = [
-        'Ligand SMILES', 'UniProt (SwissProt) Primary ID of Target Chain 1',
+        'Ligand SMILES', 'Ligand InChI Key', 'UniProt (SwissProt) Primary ID of Target Chain 1',
         'Ki (nM)', 'IC50 (nM)', 'Kd (nM)', 'EC50 (nM)', 'Target Name',
         'PDB ID(s) for Ligand-Target Complex'
     ]
     df = pd.read_csv(args.binding_db_path, sep='\t', usecols=use_cols, low_memory=False)
     
     # --- Data Cleaning and Preprocessing ---
-    print("Cleaning and preprocessing data...")
     df.rename(columns={
         'UniProt (SwissProt) Primary ID of Target Chain 1': 'uniprot_id',
         'PDB ID(s) for Ligand-Target Complex': 'pdb_id'
     }, inplace=True)
-    
+
+    # --- CHANGE: Drop rows missing the InChI Key ---
+    df.dropna(subset=['Ligand SMILES', 'Ligand InChI Key', 'uniprot_id'], inplace=True)
+
+    # Consolidate multiple affinity measurements into one column
     affinity_cols = ['Ki (nM)', 'IC50 (nM)', 'Kd (nM)', 'EC50 (nM)']
     for col in affinity_cols:
         df[col] = pd.to_numeric(df[col].astype(str).str.replace('>', '').str.replace('<', ''), errors='coerce')
-    df['affinity_nm'] = df[affinity_cols].bfill(axis=1).iloc[:, 0]
-    
-    # Do NOT require a PDB ID yet. This is the key change.
-    df.dropna(subset=['Ligand SMILES', 'uniprot_id', 'affinity_nm', 'Target Name'], inplace=True)
-    df = df[df['affinity_nm'] > 0]
+    df['affinity_nm'] = df[affinity_cols].median(axis=1)
+    df.dropna(subset=['affinity_nm'], inplace=True)
 
-    # --- Impute Missing PDB IDs ---
-    print("Imputing missing PDB IDs using a representative for each UniProt ID...")
-    # Create a map from uniprot_id to the first valid PDB ID found for it.
-    pdb_map = df.dropna(subset=['pdb_id']).groupby('uniprot_id')['pdb_id'].first()
-    df['pdb_id'] = df['uniprot_id'].map(pdb_map)
-    
-    # Now, drop any proteins for which NO PDB ID could be found at all.
-    df.dropna(subset=['pdb_id'], inplace=True)
-    print(f"Data retained after PDB imputation: {len(df)} measurements.")
-    
-    # --- Parse Mutations ---
-    print("Parsing mutations from target names...")
-    tqdm.pandas(desc="Parsing Mutations")
-    df['mutation'] = df['Target Name'].progress_apply(parse_multiple_mutations_to_string)
-    
+    # --- Separate Wild-Type and Mutant Data ---
+    df['mutation'] = df['Target Name'].apply(parse_multiple_mutations_to_string)
     df_wt = df[df['mutation'].isnull()].copy()
-    df_mt = df[df['mutation'].notnull()].copy() 
+    df_mt = df[df['mutation'].notnull()].copy()
+    
+    print(f"Separated into {len(df_wt)} wild-type and {len(df_mt)} mutant entries.")
 
-    print(f"Found {len(df_wt)} wild-type and {len(df_mt)} mutant measurements with associated PDB IDs.")
-    
-    # --- Create WT Lookup Dictionary ---
-    print("Creating wild-type affinity lookup table...")
-    wt_lookup = df_wt.groupby(['Ligand SMILES', 'uniprot_id'])['affinity_nm'].median().to_dict()
-    
-    # --- Match Mutants to Wild-Types and Generate Labels ---
-    print("Matching mutant data to wild-type and generating resistance labels...")
-    def get_wt_affinity(row):
-        return wt_lookup.get((row['Ligand SMILES'], row['uniprot_id']))
+    # --- Join WT and MT Data using InChIKey for robustness ---
+    print("Joining mutant data with corresponding wild-type data using InChIKey...")
 
-    tqdm.pandas(desc="Matching WT Affinities")
-    df_mt['wt_affinity_nm'] = df_mt.progress_apply(get_wt_affinity, axis=1)
-    df_mt.dropna(subset=['wt_affinity_nm'], inplace=True)
-    
-    df_mt['fold_change'] = df_mt['affinity_nm'] / df_mt['wt_affinity_nm']
-    df_mt['confers_resistance'] = (df_mt['fold_change'] > args.resistance_threshold).astype(int)
+    # --- CHANGE: Aggregate WT data by InChIKey before merging ---
+    wt_agg = df_wt.groupby(['uniprot_id', 'Ligand InChI Key']).agg(
+        wt_affinity_nm=('affinity_nm', 'median')
+    ).reset_index()
+
+    # --- CHANGE: Perform the merge using 'Ligand InChI Key' ---
+    merged_df = pd.merge(
+        df_mt,
+        wt_agg,
+        on=['uniprot_id', 'Ligand InChI Key']
+    )
+
+    print(f"Found {len(merged_df)} paired mutant-wild-type measurements after join.")
+    if merged_df.empty:
+        print("Could not find any paired measurements. Exiting.")
+        return
+        
+    # --- Create Resistance Label ---
+    merged_df['fold_change'] = merged_df['affinity_nm'] / merged_df['wt_affinity_nm']
+    merged_df['confers_resistance'] = (merged_df['fold_change'] > args.resistance_threshold).astype(int)
     
     # --- Finalize Dataset ---
-    output_df = df_mt[[
+    output_df = merged_df[[
         'Ligand SMILES', 'uniprot_id', 'mutation', 'pdb_id',
         'confers_resistance', 'wt_affinity_nm', 'affinity_nm'
     ]].rename(columns={'affinity_nm': 'mutant_affinity_nm'})
     
-    # Group by the unique combination and aggregate
+    # Group by the original unique combination and aggregate results
     final_df = output_df.groupby(['Ligand SMILES', 'uniprot_id', 'mutation']).agg({
-        'pdb_id': 'first', # All PDBs for this group should be the same after imputation
+        'pdb_id': 'first',
         'confers_resistance': lambda x: x.mode()[0],
         'wt_affinity_nm': 'median',
         'mutant_affinity_nm': 'median'
@@ -109,10 +95,8 @@ def main(args):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Build a drug resistance dataset from BindingDB.")
-    parser.add_argument('--binding_db_path', type=str, required=True)
-    parser.add_argument('--output_path', type=str, default='mutant_resistance_dataset_with_pdb.parquet')
-    parser.add_argument('--resistance_threshold', type=float, default=10.0)
+    parser.add_argument('--binding_db_path', type=str, required=True, help='Path to the BindingDB TSV data file.')
+    parser.add_argument('--output_path', type=str, required=True, help='Path to save the final Parquet dataset.')
+    parser.add_argument('--resistance_threshold', type=float, default=2.0, help='Fold-change in affinity to define resistance.')
     args = parser.parse_args()
     main(args)
-
-
