@@ -133,7 +133,9 @@ def main(args):
     # --- Shared Feature Preparation ---
     print("Loading protein features...")
     protein_archive = np.load(args.protein_features_path)
-    available_targets = set(protein_archive.keys())
+    protein_embeddings = {k: protein_archive[k] for k in protein_archive}
+
+    available_targets = set(protein_embeddings.keys())
     train_df = train_df[train_df['target_id'].isin(available_targets)].reset_index(drop=True)
     test_df = test_df[test_df['target_id'].isin(available_targets)].reset_index(drop=True)
 
@@ -163,7 +165,7 @@ def main(args):
     data_generator = generate_sharded_batches_jax(
         train_df,
         smiles_map,
-        protein_archive,
+        protein_embeddings,
         feature_sharding,
         batch_size=batch_size
     )
@@ -183,7 +185,7 @@ def main(args):
     data_generator = generate_sharded_batches_jax(
         test_df,
         smiles_map,
-        protein_archive,
+        protein_embeddings,
         feature_sharding,
         batch_size=batch_size
     )
