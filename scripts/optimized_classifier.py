@@ -108,7 +108,6 @@ def main(args):
     score = roc_auc_score(y_test, predictions)
 
     print("\nEvaluating model on the train set...")
-    predictions = svm.decision_function(
     predictions_train = svm.decision_function(
         norm_scaled_ligands,
         norm_scaled_proteins,
