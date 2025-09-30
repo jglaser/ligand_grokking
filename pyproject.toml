@@ -12,12 +12,13 @@ dependencies = [
     "pandas>=2.3.3",
     "tqdm>=4.66.5",
     "transformers>=4.56.2",
+    "numpy>=2.1.2",
 ]
 
 [project.optional-dependencies]
 cuda = [
   # Installs JAX with CUDA 12 support. Adjust the version as needed.
-  'jax[cuda12] ; sys_platform == "linux"',
+  'jax[cuda12]>=0.7.2 ; sys_platform == "linux"',
   'torch'
 ]
 
