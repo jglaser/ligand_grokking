@@ -65,27 +65,30 @@ def main(args):
     # --- 5. Scale and Normalize Unique Feature Matrices ---
     print("Scaling and normalizing unique feature matrices...")
     ligand_dim = ligand_features.shape[1]
-    
-    scaled_ligands = (ligand_features - scaler.mean_[:ligand_dim]) / jnp.sqrt(scaler.var_[:ligand_dim] + 1e-7)
-    scaled_proteins = (protein_features - scaler.mean_[ligand_dim:]) / jnp.sqrt(scaler.var_[ligand_dim:] + 1e-7)
+   
+    @jax.jit
+    def scale(f, mean, scale):
+        return (f - mean) / (scale + 1e-7)
+
+    ligand_features = scale(ligand_features, scaler.mean_[:ligand_dim], jnp.sqrt(scaler.var_[:ligand_dim]))
+    protein_features = scale(protein_features, scaler.mean_[ligand_dim:], jnp.sqrt(scaler.var_[ligand_dim:]))
 
     def normalize(x, axis=None, epsilon=1e-12):
         square_sum = jnp.sum(jnp.square(x), axis=axis, keepdims=True)
         x_inv_norm = 1. / jnp.sqrt(jnp.maximum(square_sum, epsilon))
         return x * x_inv_norm
 
-    norm_scaled_ligands = normalize(scaled_ligands, axis=1)
-    norm_scaled_proteins = normalize(scaled_proteins, axis=1)
+    ligand_features = normalize(ligand_features, axis=1)
+    protein_features = normalize(protein_features, axis=1)
 
     # --- 6. Train Out-of-Core JAX Kernel SVM ---
-    gamma = args.gamma
     svm = JaxOutOfCoreKernelSVM(C=args.C, max_iter=args.epochs, random_seed=args.random_seed,
                                 predict_batch_size=args.predict_batch_size, gamma=args.gamma,
                                 tol=args.tol, epsilon=args.eps)
 
     svm.fit(
-        norm_scaled_ligands,
-        norm_scaled_proteins,
+        ligand_features,
+        protein_features,
         train_pairs,
         jnp.array(y_train)
     )
@@ -93,8 +96,8 @@ def main(args):
     # --- 7. Evaluation ---
     print("\nEvaluating model on the test set...")
     predictions = svm.decision_function(
-        norm_scaled_ligands,
-        norm_scaled_proteins,
+        ligand_features,
+        protein_features,
         test_pairs
     )
     score = roc_auc_score(y_test, predictions)
