@@ -102,17 +102,8 @@ def main(args):
     )
     score = roc_auc_score(y_test, predictions)
 
-    print("\nEvaluating model on the train set...")
-    predictions_train = svm.decision_function(
-        norm_scaled_ligands,
-        norm_scaled_proteins,
-        train_pairs
-    )
-    score_train = roc_auc_score(y_train, predictions_train)
-
     print("\n--- Results ---")
     print(f"Test Set ROC AUC Score: {score:.4f}")
-    print(f"Train Set ROC AUC Score: {score_train:.4f}")
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Train a drug resistance classifier using the Out-of-Core JAX Kernel SVM.")
