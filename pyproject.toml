@@ -3,14 +3,72 @@ name = "ligand-grokking"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 dependencies = [
+    "jax",
     "polars[deltalake]>=1.33.1",
     "rdkit>=2025.3.6",
+]
+
+[project.optional-dependencies]
+cuda = [
+  # Installs JAX with CUDA 12 support. Adjust the version as needed.
+  'jax[cuda12] ; sys_platform == "linux"',
+  'torch'
+]
+
+rocm = [
+  # Installs JAX with ROCm support.
+  'jax[rocm]>=0.4.50 ; sys_platform == "linux"',
+  'torch',
+  'pytorch-triton-rocm ; sys_platform == "linux"'
+]
+
+cpu = [
+  'torch',
+  'jax',
+]
+
+[tool.uv]
+conflicts = [
+  [
+    { extra = "cpu" },
+    { extra = "cuda" },
+    { extra = "rocm" },
+  ],
 ]
 
 [dependency-groups]
 dev = [
     "jedi-language-server>=0.45.1",
     "ruff>=0.13.0",
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu129"
+url = "https://download.pytorch.org/whl/cu129"
+
+[[tool.uv.index]]
+name = "pytorch-rocm"
+url = "https://download.pytorch.org/whl/rocm6.4"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+  { index = "pytorch-cpu", extra = "cpu" },
+  { index = "pytorch-cu129", extra = "cuda" },
+  { index = "pytorch-rocm", extra = "rocm" },
+]
+pytorch-triton-rocm = [
+  { index = "pytorch-rocm", extra = "rocm" },
 ]
