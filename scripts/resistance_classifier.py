@@ -11,9 +11,6 @@ from sklearn.metrics import roc_auc_score
 from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import SGDClassifier
 
-# XGBoost for the in-memory path
-from xgboost import XGBClassifier
-
 # PyTorch and Transformers for featurization
 import torch
 from transformers import AutoModel, AutoTokenizer, T5EncoderModel, T5Tokenizer
