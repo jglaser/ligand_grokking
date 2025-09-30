@@ -122,8 +122,8 @@ if __name__ == '__main__':
     parser.add_argument('--batch_size', type=int, default=32, help="Batch size for scaler fitting.")
     parser.add_argument('--predict_batch_size', type=int, default=32, help="Batch size for inference.")
     parser.add_argument('--C', type=float, default=1.0, help="Regularization parameter for the SVM.")
-    parser.add_argument('--tol', type=float, default=1e-7, help="KKT tolerance.")
-    parser.add_argument('--eps', type=float, default=1e-9, help="KKT epsilon. Should be smaller than --tol")
+    parser.add_argument('--tol', type=float, default=1e-4, help="KKT tolerance.")
+    parser.add_argument('--eps', type=float, default=1e-5, help="KKT epsilon. Should be smaller than --tol")
     parser.add_argument('--gamma', type=float, default=0.01, help="Gamma parameter for the RBF kernel.")
     args = parser.parse_args()
 
