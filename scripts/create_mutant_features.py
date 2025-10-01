@@ -336,9 +336,17 @@ def process_uniprot_id(uniprot_id, uniprot_to_mutations, max_transcripts_to_chec
                     alternate_bases=variant_info['alternate_bases']
                 )
 
+                tracks = [t.upper() for t in args.tracks]
+                if len(tracks) == 0:
+                    tracks=list(dna_client.OutputType)
+                else:
+                    for t in tracks:
+                        if t not in list(dna_client.OutputType):
+                            raise ValueError(f"Track {t} not supported. Available tracks: {list(dna_client.OutputType)}")
+
                 variant_predictions = ag_model_client.predict_variant(
                     interval=interval, variant=variant,
-                    requested_outputs=list(dna_client.OutputType),
+                    requested_outputs=tracks,
                     ontology_terms=['EFO:0002067']
                 )
 
@@ -411,6 +419,7 @@ if __name__ == '__main__':
     parser.add_argument('--output_path', type=str, default='mutant_delta_vectors.npz')
     parser.add_argument('--feature_type', type=str, choices=['delta', 'mutant_only', 'wt_only', 'randomized_delta'],
                         default='delta'),
+    parser.add_argument('--tracks', type=str, nargs='+', default=[], help='Feature tracks, e.g. SPLICE_SITES, SPLICE_SITE_USAGE')
     parser.add_argument('--random_seed', type=int, default=123)
     parser.add_argument('--max_transcripts_to_check', type=int, default=25,
                         help='Maximum number of longest, protein-coding transcripts to check per gene for alignment.')
