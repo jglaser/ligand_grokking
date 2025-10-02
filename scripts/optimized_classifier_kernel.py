@@ -15,6 +15,7 @@ from sklearn.metrics import roc_auc_score
 from utils import BatchedStandardScaler
 from bcd_svm_out_of_core_kernel import JaxOutOfCoreKernelSVM
 
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 def main(args):
     print("--- Training Drug Resistance Classifier with Out-of-Core JAX Kernel SVM ---")
@@ -42,9 +43,25 @@ def main(args):
     ligand_idx_map = {smile: i for i, smile in enumerate(smiles_map.keys())}
     protein_idx_map = {tid: i for i, tid in enumerate(protein_map.keys())}
 
-    ligand_features = jnp.array(list(smiles_map.values()))
-    protein_features = jnp.array(list(protein_map.values()))
-    
+    mesh = Mesh(np.array(jax.devices()), ('i'))
+    sharding = NamedSharding(mesh, P('i'))
+    smiles_val = np.stack(list(smiles_map.values()))
+    protein_val = np.stack(list(protein_map.values()))
+    n_devices = len(jax.devices())
+
+    def pad_length(length, multiple):
+        remainder = length % multiple
+        if remainder == 0:
+            return 0
+        else:
+            return multiple - remainder
+
+    smiles_val = np.pad(smiles_val, ((0, pad_length(len(smiles_val), n_devices)), (0,0)))
+    protein_val = np.pad(protein_val, ((0, pad_length(len(protein_val), n_devices)), (0,0)))
+
+    ligand_features = jnp.array(smiles_val, device=sharding)
+    protein_features = jnp.array(protein_val, device=sharding)
+
     train_pairs = jnp.array([[ligand_idx_map[s], protein_idx_map[t]] for s, t in zip(train_df['Ligand SMILES'], train_df['target_id'])])
     test_pairs = jnp.array([[ligand_idx_map[s], protein_idx_map[t]] for s, t in zip(test_df['Ligand SMILES'], test_df['target_id'])])
     

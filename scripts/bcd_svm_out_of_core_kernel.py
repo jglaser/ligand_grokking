@@ -168,100 +168,62 @@ class JaxOutOfCoreKernelSVM:
             return jax.lax.cond(is_valid_pair, optimization_logic, lambda _: (alphas, b, errors, False), None)
         return update_step
 
-    def decision_function(self, test_ligand_features, test_protein_features, test_pairs):
+    def decision_function(self, test_ligand_features, test_protein_features, test_pairs, sv_batch_size=32):
         sv_indices = jnp.where(self.alphas > self.epsilon)[0]
         sv_alphas_y = self.alphas[sv_indices] * self.y_train[sv_indices]
         sv_pairs = self.train_pairs[sv_indices]
+        num_svs = len(sv_indices)
 
-        print(f"Making predictions for {len(test_pairs)} pairs using {len(sv_indices)} SVs.")
-
-        @partial(jax.jit, static_argnames=('self',))
-        def predict_batch_kernel(self, batch_test_pairs, train_lig_feats, train_prot_feats,
-                                 test_lig_feats, test_prot_feats, sv_pairs, sv_alphas_y_vals):
-            def score_one_test_pair(test_pair):
-                test_lig_feat = test_lig_feats[test_pair[0]]
-                test_prot_feat = test_prot_feats[test_pair[1]]
-                
-                def get_kernel_vs_one_sv(sv_pair):
-                    sv_lig_feat = train_lig_feats[sv_pair[0]]
-                    sv_prot_feat = train_prot_feats[sv_pair[1]]
-                    
-                    # Combine features for kernel calculation
-                    x_test = jnp.concatenate([test_lig_feat, test_prot_feat])
-                    x_sv = jnp.concatenate([sv_lig_feat, sv_prot_feat])
-
-                    return self.kernel(x_test, x_sv)
-
-                kernel_values = jax.vmap(get_kernel_vs_one_sv)(sv_pairs)
-                return jnp.dot(kernel_values, sv_alphas_y_vals) + self.b
-            
-            # Using vmap for parallelism in prediction
-            return jax.vmap(score_one_test_pair)(batch_test_pairs)
-
-        all_scores = jnp.zeros(len(test_pairs))
-        for i in tqdm(range(0, len(test_pairs), self.predict_batch_size), desc="Predicting in batches"):
-            batch_test_pairs = test_pairs[i:i+self.predict_batch_size]
-
-            batch_scores = predict_batch_kernel(
-                self, batch_test_pairs,
-                self.X_ligand_train, self.X_protein_train,
-                test_ligand_features, test_protein_features,
-                sv_pairs, sv_alphas_y
-            )
-            all_scores = all_scores.at[i:i+len(batch_scores)].set(batch_scores)
-
-        return all_scores
-
-    def decision_function(self, test_ligand_features, test_protein_features, test_pairs):
-        sv_indices = jnp.where(self.alphas > self.epsilon)[0]
-        sv_alphas_y = self.alphas[sv_indices] * self.y_train[sv_indices]
-        sv_pairs = self.train_pairs[sv_indices]
-
-        print(f"Making predictions for {len(test_pairs)} pairs using {len(sv_indices)} SVs.")
+        print(f"Making predictions for {len(test_pairs)} pairs using {num_svs} SVs.")
 
         @partial(jax.jit, static_argnames=('self',))
-        def predict_batch_kernel(self, batch_test_pairs, train_lig_feats, train_prot_feats,
-                                 test_lig_feats, test_prot_feats, sv_pairs, sv_alphas_y_vals):
+        def predict_batch_kernel(self, batch_test_lig_feats, batch_test_prot_feats,
+                                 sv_lig_feats, sv_prot_feats, sv_alphas_y_vals):
 
-            # This function scores ONE test point against ALL support vectors.
-            # It uses a vmap and is a highly parallel, efficient unit of work.
-            def score_one_test_pair(test_pair):
-                test_lig_feat = test_lig_feats[test_pair[0]]
-                test_prot_feat = test_prot_feats[test_pair[1]]
+            def score_one_test_pair(test_lig_feat, test_prot_feat):
                 x_test = jnp.concatenate([test_lig_feat, test_prot_feat])
 
-                def get_kernel_vs_one_sv(sv_pair):
-                    sv_lig_feat = train_lig_feats[sv_pair[0]]
-                    sv_prot_feat = train_prot_feats[sv_pair[1]]
+                def get_kernel_vs_one_sv(sv_lig_feat, sv_prot_feat):
                     x_sv = jnp.concatenate([sv_lig_feat, sv_prot_feat])
                     return self.kernel(x_test, x_sv)
 
-                kernel_values = jax.vmap(get_kernel_vs_one_sv)(sv_pairs)
-                return jnp.dot(kernel_values, sv_alphas_y_vals) + self.b
+                kernel_values = jax.vmap(get_kernel_vs_one_sv)(sv_lig_feats, sv_prot_feats)
+                return jnp.dot(kernel_values, sv_alphas_y_vals)
 
-            # --- THE FIX ---
-            # Instead of a second vmap, we use a JIT-compatible fori_loop.
-            # This processes the batch sequentially within the compiled kernel.
-            def loop_body(i, scores_array):
-                test_pair = batch_test_pairs[i]
-                score = score_one_test_pair(test_pair)
-                return scores_array.at[i].set(score)
-
-            initial_scores = jnp.zeros(batch_test_pairs.shape[0])
-            # note: the fori_loop defeats the purpose of the predict_batch_size
-            # this is to avoid oversubcsribing GPU threads
-            return jax.lax.fori_loop(0, batch_test_pairs.shape[0], loop_body, initial_scores)
+            return jax.vmap(score_one_test_pair)(batch_test_lig_feats, batch_test_prot_feats)
 
         all_scores = jnp.zeros(len(test_pairs))
+
+        # Outer loop: Iterate over test pairs in batches
         for i in tqdm(range(0, len(test_pairs), self.predict_batch_size), desc="Predicting in batches"):
             batch_test_pairs = test_pairs[i:i+self.predict_batch_size]
+            batch_test_ligand_indices = batch_test_pairs[:, 0]
+            batch_test_protein_indices = batch_test_pairs[:, 1]
+            batch_test_ligand_features = test_ligand_features[batch_test_ligand_indices]
+            batch_test_protein_features = test_protein_features[batch_test_protein_indices]
 
-            batch_scores = predict_batch_kernel(
-                self, batch_test_pairs,
-                self.X_ligand_train, self.X_protein_train,
-                test_ligand_features, test_protein_features,
-                sv_pairs, sv_alphas_y
-            )
-            all_scores = all_scores.at[i:i+len(batch_scores)].set(batch_scores)
+            batch_scores = jnp.zeros(len(batch_test_pairs))
+
+            # Inner loop: Iterate over support vectors in batches
+            for j in range(0, num_svs, sv_batch_size):
+                sv_batch_indices = sv_indices[j:j+sv_batch_size]
+                sv_batch_alphas_y = sv_alphas_y[j:j+sv_batch_size]
+                sv_batch_pairs = sv_pairs[j:j+sv_batch_size]
+
+                sv_batch_ligand_indices = sv_batch_pairs[:, 0]
+                sv_batch_protein_indices = sv_batch_pairs[:, 1]
+
+                sv_batch_ligand_features = self.X_ligand_train[sv_batch_ligand_indices]
+                sv_batch_protein_features = self.X_protein_train[sv_batch_protein_indices]
+
+                # Calculate partial scores against the current batch of SVs
+                partial_scores = predict_batch_kernel(
+                    self, batch_test_ligand_features, batch_test_protein_features,
+                    sv_batch_ligand_features, sv_batch_protein_features,
+                    sv_batch_alphas_y
+                )
+                batch_scores += partial_scores
+
+            all_scores = all_scores.at[i:i+len(batch_scores)].set(batch_scores + self.b)
 
         return all_scores
