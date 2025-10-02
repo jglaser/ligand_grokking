@@ -168,62 +168,62 @@ class JaxOutOfCoreKernelSVM:
             return jax.lax.cond(is_valid_pair, optimization_logic, lambda _: (alphas, b, errors, False), None)
         return update_step
 
-    def decision_function(self, test_ligand_features, test_protein_features, test_pairs, sv_batch_size=32):
+    def decision_function(self, test_ligand_features, test_protein_features, test_pairs, sv_batch_size=128):
+        """
+        Assumes that test_ligand_features and test_protein_features are arrays of unique features.
+        The indices in test_pairs and sv_pairs map directly to these unique feature arrays.
+        """
         sv_indices = jnp.where(self.alphas > self.epsilon)[0]
         sv_alphas_y = self.alphas[sv_indices] * self.y_train[sv_indices]
         sv_pairs = self.train_pairs[sv_indices]
         num_svs = len(sv_indices)
 
-        print(f"Making predictions for {len(test_pairs)} pairs using {num_svs} SVs.")
-
-        @partial(jax.jit, static_argnames=('self',))
-        def predict_batch_kernel(self, batch_test_lig_feats, batch_test_prot_feats,
-                                 sv_lig_feats, sv_prot_feats, sv_alphas_y_vals):
-
-            def score_one_test_pair(test_lig_feat, test_prot_feat):
-                x_test = jnp.concatenate([test_lig_feat, test_prot_feat])
-
-                def get_kernel_vs_one_sv(sv_lig_feat, sv_prot_feat):
-                    x_sv = jnp.concatenate([sv_lig_feat, sv_prot_feat])
-                    return self.kernel(x_test, x_sv)
-
-                kernel_values = jax.vmap(get_kernel_vs_one_sv)(sv_lig_feats, sv_prot_feats)
-                return jnp.dot(kernel_values, sv_alphas_y_vals)
-
-            return jax.vmap(score_one_test_pair)(batch_test_lig_feats, batch_test_prot_feats)
+        print(f"SPMD prediction for {len(test_pairs)} pairs (assuming unique features).")
 
         all_scores = jnp.zeros(len(test_pairs))
 
-        # Outer loop: Iterate over test pairs in batches
-        for i in tqdm(range(0, len(test_pairs), self.predict_batch_size), desc="Predicting in batches"):
-            batch_test_pairs = test_pairs[i:i+self.predict_batch_size]
-            batch_test_ligand_indices = batch_test_pairs[:, 0]
-            batch_test_protein_indices = batch_test_pairs[:, 1]
-            batch_test_ligand_features = test_ligand_features[batch_test_ligand_indices]
-            batch_test_protein_features = test_protein_features[batch_test_protein_indices]
+        # This JIT'd function computes the scores for one batch of SVs against ALL test pairs.
+        # JAX will handle parallelizing the computation over the sharded test feature arrays.
+        @partial(jax.jit, static_argnames=('self',))
+        def compute_scores_for_sv_batch(self, test_ligand_features, test_protein_features,
+                                          test_pairs,
+                                          sv_batch_lig_feats, sv_batch_prot_feats,
+                                          sv_batch_pairs,
+                                          sv_batch_alphas_y):
 
-            batch_scores = jnp.zeros(len(batch_test_pairs))
+            # Compute kernel blocks between ALL test features and the CURRENT SV batch features.
+            # This leverages SPMD for maximum parallelism on the sharded test data.
+            K_lig_block = jax.vmap(lambda x1: jax.vmap(lambda x2: self.kernel(x1, x2))(sv_batch_lig_feats))(test_ligand_features)
+            K_prot_block = jax.vmap(lambda x1: jax.vmap(lambda x2: self.kernel(x1, x2))(sv_batch_prot_feats))(test_protein_features)
 
-            # Inner loop: Iterate over support vectors in batches
-            for j in range(0, num_svs, sv_batch_size):
-                sv_batch_indices = sv_indices[j:j+sv_batch_size]
-                sv_batch_alphas_y = sv_alphas_y[j:j+sv_batch_size]
-                sv_batch_pairs = sv_pairs[j:j+sv_batch_size]
+            # Gather the results for all test pairs using their direct indices.
+            full_K_lig_batch = K_lig_block[test_pairs[:, 0], :][:, sv_batch_pairs[:, 0]]
+            full_K_prot_batch = K_prot_block[test_pairs[:, 1], :][:, sv_batch_pairs[:, 1]]
 
-                sv_batch_ligand_indices = sv_batch_pairs[:, 0]
-                sv_batch_protein_indices = sv_batch_pairs[:, 1]
+            # Compute partial scores for this SV batch.
+            return jnp.sum((full_K_lig_batch * full_K_prot_batch) * sv_batch_alphas_y, axis=1)
 
-                sv_batch_ligand_features = self.X_ligand_train[sv_batch_ligand_indices]
-                sv_batch_protein_features = self.X_protein_train[sv_batch_protein_indices]
+        # Outer Loop: Iterate over support vectors in batches (for out-of-core SVs)
+        for i in tqdm(range(0, num_svs, sv_batch_size), desc="SV Batches (SPMD, unique features)"):
+            sv_slice = slice(i, i + sv_batch_size)
+            sv_batch_pairs = sv_pairs[sv_slice]
+            sv_batch_alphas_y = sv_alphas_y[sv_slice]
 
-                # Calculate partial scores against the current batch of SVs
-                partial_scores = predict_batch_kernel(
-                    self, batch_test_ligand_features, batch_test_protein_features,
-                    sv_batch_ligand_features, sv_batch_protein_features,
-                    sv_batch_alphas_y
-                )
-                batch_scores += partial_scores
+            # Gather the features for the current batch of support vectors.
+            sv_batch_lig_feats = self.X_ligand_train[sv_batch_pairs[:, 0]]
+            sv_batch_prot_feats = self.X_protein_train[sv_batch_pairs[:, 1]]
 
-            all_scores = all_scores.at[i:i+len(batch_scores)].set(batch_scores + self.b)
+            # Execute the JIT'd kernel ONCE per SV batch.
+            # Note: We pass the full test feature arrays here. JAX handles the sharding.
+            partial_scores = compute_scores_for_sv_batch(
+                self, test_ligand_features, test_protein_features,
+                test_pairs,
+                sv_batch_lig_feats, sv_batch_prot_feats,
+                sv_batch_pairs,
+                sv_batch_alphas_y
+            )
 
-        return all_scores
+            # Accumulate the scores.
+            all_scores += partial_scores
+
+        return all_scores + self.b
