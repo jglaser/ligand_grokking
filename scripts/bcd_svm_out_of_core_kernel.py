@@ -182,26 +182,26 @@ class JaxOutOfCoreKernelSVM:
 
         all_scores = jnp.zeros(len(test_pairs))
 
-        # This JIT'd function computes the scores for one batch of SVs against ALL test pairs.
-        # JAX will handle parallelizing the computation over the sharded test feature arrays.
         @partial(jax.jit, static_argnames=('self',))
         def compute_scores_for_sv_batch(self, test_ligand_features, test_protein_features,
                                           test_pairs,
                                           sv_batch_lig_feats, sv_batch_prot_feats,
-                                          sv_batch_pairs,
                                           sv_batch_alphas_y):
 
             # Compute kernel blocks between ALL test features and the CURRENT SV batch features.
-            # This leverages SPMD for maximum parallelism on the sharded test data.
             K_lig_block = jax.vmap(lambda x1: jax.vmap(lambda x2: self.kernel(x1, x2))(sv_batch_lig_feats))(test_ligand_features)
             K_prot_block = jax.vmap(lambda x1: jax.vmap(lambda x2: self.kernel(x1, x2))(sv_batch_prot_feats))(test_protein_features)
 
-            # Gather the results for all test pairs using their direct indices.
-            full_K_lig_batch = K_lig_block[test_pairs[:, 0], :][:, sv_batch_pairs[:, 0]]
-            full_K_prot_batch = K_prot_block[test_pairs[:, 1], :][:, sv_batch_pairs[:, 1]]
+            # --- THE FIX ---
+            # 1. Gather the rows corresponding to the test pairs. The columns are already correctly ordered.
+            K_lig_for_pairs = K_lig_block[test_pairs[:, 0], :]
+            K_prot_for_pairs = K_prot_block[test_pairs[:, 1], :]
 
-            # Compute partial scores for this SV batch.
-            return jnp.sum((full_K_lig_batch * full_K_prot_batch) * sv_batch_alphas_y, axis=1)
+            # 2. Element-wise product to get the full kernel for each pair vs. each SV in the batch.
+            full_K_batch = K_lig_for_pairs * K_prot_for_pairs
+
+            # 3. Compute partial scores by taking the dot product with the alphas for this batch.
+            return jnp.sum(full_K_batch * sv_batch_alphas_y, axis=1)
 
         # Outer Loop: Iterate over support vectors in batches (for out-of-core SVs)
         for i in tqdm(range(0, num_svs, sv_batch_size), desc="SV Batches (SPMD, unique features)"):
@@ -209,21 +209,16 @@ class JaxOutOfCoreKernelSVM:
             sv_batch_pairs = sv_pairs[sv_slice]
             sv_batch_alphas_y = sv_alphas_y[sv_slice]
 
-            # Gather the features for the current batch of support vectors.
             sv_batch_lig_feats = self.X_ligand_train[sv_batch_pairs[:, 0]]
             sv_batch_prot_feats = self.X_protein_train[sv_batch_pairs[:, 1]]
 
-            # Execute the JIT'd kernel ONCE per SV batch.
-            # Note: We pass the full test feature arrays here. JAX handles the sharding.
             partial_scores = compute_scores_for_sv_batch(
                 self, test_ligand_features, test_protein_features,
                 test_pairs,
                 sv_batch_lig_feats, sv_batch_prot_feats,
-                sv_batch_pairs,
                 sv_batch_alphas_y
             )
 
-            # Accumulate the scores.
             all_scores += partial_scores
 
         return all_scores + self.b
