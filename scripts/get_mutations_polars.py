@@ -112,7 +112,7 @@ def main(args):
     final_cols = ['uniprot_id', 'mutation', 'canonical_smiles', 'confers_resistance']
     final_df = df.groupby(['uniprot_id', 'mutation', 'canonical_smiles']).agg(
         confers_resistance=('confers_resistance', lambda x: x.mode()[0] if not x.empty else 0)
-    ).reset_index().rename(columns={"canonical_smiles": "smiles"})
+    ).reset_index().rename(columns={"canonical_smiles": "Ligand SMILES"})
 
     print(f"\n--- 5. Final Dataset ---")
     print(f"Generated a final dataset with {len(final_df)} unique entries.")
