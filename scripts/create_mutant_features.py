@@ -140,6 +140,11 @@ def find_best_matching_transcript(e_service, gene_data, uniprot_seq, max_transcr
 
     return best_transcript, None
 
+def reverse_complement(dna_seq):
+    """Computes the reverse complement of a DNA sequence."""
+    complement = {'A': 'T', 'T': 'A', 'C': 'G', 'G': 'C'}
+    return "".join(complement.get(base, base) for base in reversed(dna_seq))
+
 def get_variant_info(uniprot_protein_seq, transcript_data, mutation, gene_strand):
     """
     Translates a protein mutation to a genomic variant using a hybrid, 
@@ -258,6 +263,10 @@ def get_variant_info(uniprot_protein_seq, transcript_data, mutation, gene_strand
                     genomic_pos_of_mutation = exon['end'] - offset_in_exon
                     break
                 bases_covered += exon_len
+            
+            # **FIX**: Reverse-complement the bases for the negative strand
+            ref_bases = reverse_complement(ref_bases)
+            alt_bases = reverse_complement(alt_bases)
 
         if genomic_pos_of_mutation == -1:
             return None, "Failed to map CDS position to a genomic coordinate."
